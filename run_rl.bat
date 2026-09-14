@@ -10,7 +10,7 @@ echo   Tick Rate:  20 decisions/sec (50ms interval)
 echo ========================================================
 echo.
 echo Reward System:
-echo   Aim Centering:        +2.0 max (crosshair on enemy)
+echo   Aim Centering:        +10.0 max (looking directly at enemy)
 echo   3-Block Ideal Range:  +2.0 (optimal spacing)
 echo   Circle-Strafing:      +0.5 (dodging attacks)
 echo   Sweep Hit:            +10.0 (grounded attack)

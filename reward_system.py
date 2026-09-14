@@ -202,10 +202,17 @@ class PvPRewardEngine:
                 hit_type = "jump_spam_penalty"
 
         if det["has_target"]:
-            # 2. Aim Centering Reward
-            # Peaks at +2.0 when crosshair is dead center; decays with distance
+            # 2. High Aim Centering & Enemy Tracking Reward
+            # Rewarded highly for looking directly at the enemy and keeping crosshair centered!
             dist_to_ch = np.hypot(det["dx"], det["dy"])
-            r_aim = 2.0 * max(0.0, 1.0 - (dist_to_ch / 140.0))
+            if dist_to_ch <= 35:
+                r_aim = 10.0  # Bullseye tracking: crosshair dead-center on enemy!
+            elif dist_to_ch <= 80:
+                # On target body: smooth gradient between +6.0 and +10.0
+                r_aim = 6.0 + 4.0 * (1.0 - (dist_to_ch - 35.0) / 45.0)
+            else:
+                # Approaching target: decays from +6.0 down to 0.0 at 180px
+                r_aim = max(0.0, 6.0 * (1.0 - (dist_to_ch - 80.0) / 100.0))
 
             # 3. Optimal Spacing (~3 blocks ideal distance)
             # At 3 blocks, enemy height on 640x480 is ~170px to 270px
