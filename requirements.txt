@@ -10,3 +10,4 @@ matplotlib
 mss
 pywin32
 pydirectinput
+pynput

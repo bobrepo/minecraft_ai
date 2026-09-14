@@ -153,8 +153,8 @@ class InputController:
         else:
             self.release_key("space")
 
-    def move_mouse(self, dx: int, dy: int):
-        """Rotate first-person 3D camera by relative pixel deltas."""
+    def _send_mouse_raw(self, dx: int, dy: int):
+        """Low-level Windows SendInput dispatch."""
         if dx == 0 and dy == 0:
             return
         extra = ctypes.c_ulong(0)
@@ -162,6 +162,41 @@ class InputController:
         ii_.mi = MouseInput(int(dx), int(dy), 0, MOUSEEVENTF_MOVE, 0, ctypes.pointer(extra))
         x = Input(ctypes.c_ulong(INPUT_MOUSE), ii_)
         ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+
+    def move_mouse(self, dx: float | int, dy: float | int, dynamic: bool = True):
+        """Rotate first-person 3D camera with dynamic sub-tick micro-step smoothing.
+
+        Splits larger aim deltas (>22px) into 2-3 rapid micro-packets (1ms delay)
+        to eliminate camera skipping in Minecraft and produce fluid, human-like tracking.
+        """
+        dx_val = float(dx)
+        dy_val = float(dy)
+        if dx_val == 0.0 and dy_val == 0.0:
+            return
+
+        # Clamp vertical deflection per tick to prevent over-pitching into zenith or nadir
+        dy_val = max(-65.0, min(65.0, dy_val))
+
+        mag = (dx_val * dx_val + dy_val * dy_val) ** 0.5
+        if dynamic and mag > 22.0:
+            steps = 3 if mag > 55.0 else 2
+            step_dx = dx_val / steps
+            step_dy = dy_val / steps
+            accum_x, accum_y = 0, 0
+            for i in range(steps):
+                if i == steps - 1:
+                    cx = int(round(dx_val - accum_x))
+                    cy = int(round(dy_val - accum_y))
+                else:
+                    cx = int(round(step_dx))
+                    cy = int(round(step_dy))
+                    accum_x += cx
+                    accum_y += cy
+                self._send_mouse_raw(cx, cy)
+                if i < steps - 1:
+                    time.sleep(0.001)
+        else:
+            self._send_mouse_raw(int(round(dx_val)), int(round(dy_val)))
 
     def left_down(self):
         """Press left mouse button (punch/attack start)."""

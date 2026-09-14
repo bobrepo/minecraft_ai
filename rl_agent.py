@@ -386,21 +386,26 @@ class RLPvpAgent:
             self.prev_dx = cur_dx
             self.prev_dy = cur_dy
         else:
-            # Target NOT in view: check spatial memory trajectory predictor
-            pred_state = self.reward_engine.predictor.get_current_state()
-            if pred_state.get("is_predicting") and pred_state.get("confidence", 0.0) > 0.15:
-                # Steer camera smoothly along predicted intercept vector ("look at there")!
-                p_dx = float(pred_state["pred_dx"])
-                p_dy = float(pred_state["pred_dy"])
-                ang = math.atan2(p_dy, p_dx)
-                dist = math.hypot(p_dx, p_dy)
-                conf = float(pred_state["confidence"])
-                turn_speed = min(self.max_aim_delta * 0.85, max(30.0, dist * 0.40)) * conf
-                dx = float(np.clip(turn_speed * math.cos(ang), -self.max_aim_delta, self.max_aim_delta))
-                dy = float(np.clip(turn_speed * math.sin(ang) * 0.70, -self.max_aim_delta * 0.75, self.max_aim_delta * 0.75))
+            if det and det.get("is_facing_sky", False):
+                # Camera is pitched up into empty sky: automatically pull camera down to eye level!
+                dx = 0.0
+                dy = 38.0
             else:
-                # Fallback to discrete omnidirectional search sweeps
-                dx, dy = self.AIM_DELTAS[aim_act]
+                # Target NOT in view: check spatial memory trajectory predictor
+                pred_state = self.reward_engine.predictor.get_current_state()
+                if pred_state.get("is_predicting") and pred_state.get("confidence", 0.0) > 0.15:
+                    # Steer camera smoothly along predicted intercept vector ("look at there")!
+                    p_dx = float(pred_state["pred_dx"])
+                    p_dy = float(pred_state["pred_dy"])
+                    ang = math.atan2(p_dy, p_dx)
+                    dist = math.hypot(p_dx, p_dy)
+                    conf = float(pred_state["confidence"])
+                    turn_speed = min(self.max_aim_delta * 0.85, max(30.0, dist * 0.40)) * conf
+                    dx = float(np.clip(turn_speed * math.cos(ang), -self.max_aim_delta, self.max_aim_delta))
+                    dy = float(np.clip(turn_speed * math.sin(ang) * 0.70, -self.max_aim_delta * 0.75, self.max_aim_delta * 0.75))
+                else:
+                    # Fallback to discrete omnidirectional search sweeps
+                    dx, dy = self.AIM_DELTAS[aim_act]
 
             self.prev_dx = 0.0
             self.prev_dy = 0.0
@@ -414,7 +419,8 @@ class RLPvpAgent:
         a = (move_act == 3)
         d = (move_act == 4)
         s = (move_act == 5)
-        jump = (jump_act == 1)
+        # Disallow jumping into empty sky
+        jump = (jump_act == 1) and not (det and det.get("is_facing_sky", False))
 
         self.input_ctrl.set_movement(w=w, s=s, a=a, d=d, sprint=sprint, jump=jump)
 

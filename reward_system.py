@@ -446,7 +446,16 @@ class PvPRewardEngine:
 
         else:
             # Target NOT currently visible: NEGATIVE penalty for losing visual lock on enemy!
-            if pred_info.get("is_predicting", False) and pred_info.get("confidence", 0.0) > 0.15:
+            if det.get("is_facing_sky", False):
+                # Staring up at the sky / clouds: heavy negative penalty
+                r_aim = -2.0
+                r_pred = 0.0
+                if hit_type == "none":
+                    hit_type = "sky_penalty"
+                # Heavy penalty for jumping while staring into empty sky
+                if actions.get("jump") or action_flags.get("jump_spam"):
+                    r_jump_spam = -2.0
+            elif pred_info.get("is_predicting", False) and pred_info.get("confidence", 0.0) > 0.15:
                 # Target recently lost: award predictive search guidance if steering along trajectory
                 act_dx = float(actions.get("dx", 0.0))
                 act_dy = float(actions.get("dy", 0.0))

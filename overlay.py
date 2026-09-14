@@ -370,7 +370,9 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         if ht and ht != "none":
                             state["event_text"] = ht.upper().replace("_", " ")
                             state["event_timer"] = 24
-                            if "knockback" in ht:
+                            if "sky" in ht:
+                                state["event_color"] = "#ef4444"
+                            elif "knockback" in ht:
                                 state["event_color"] = "#ef4444"
                             elif "crit" in ht:
                                 state["event_color"] = "#a855f7"
