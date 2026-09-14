@@ -14,6 +14,7 @@ import ctypes
 import os
 import random
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -131,6 +132,35 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class AsyncTrainer:
+    """Asynchronous background worker that continuously optimizes Q-Network on GPU.
+
+    Decouples heavy GPU backpropagation (~40ms) from the 20 TPS combat loop,
+    ensuring combat execution remains locked at 50ms per tick with zero lag.
+    """
+
+    def __init__(self, agent: "RLPvpAgent", batch_size: int = 32, interval_sec: float = 0.05):
+        self.agent = agent
+        self.batch_size = batch_size
+        self.interval_sec = interval_sec
+        self._running = True
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while self._running:
+            try:
+                if self.agent.is_active and len(self.agent.replay_buffer) >= self.batch_size * 2:
+                    self.agent.train_step(batch_size=self.batch_size)
+            except Exception:
+                pass
+            time.sleep(self.interval_sec)
+
+    def stop(self):
+        self._running = False
+        self._thread.join(timeout=1.0)
+
+
 class RLPvpAgent:
     """Reinforcement Learning Combat Agent running at 20 TPS."""
 
@@ -206,6 +236,9 @@ class RLPvpAgent:
         self.step_count = 0
         self.last_loss = 0.0
 
+        # Asynchronous background GPU trainer (prevents 40ms blocking spikes in combat loop)
+        self.async_trainer = AsyncTrainer(self, batch_size=32, interval_sec=0.05)
+
     @property
     def is_active(self) -> bool:
         return self.killswitch.is_active
@@ -229,10 +262,13 @@ class RLPvpAgent:
                 dx = det["dx"]
                 aim_act = 1 if dx < -50 else (2 if dx < -10 else (3 if dx > 10 else (4 if dx > 50 else 0)))
 
-                # 2. Movement heuristic with W-Tap sprint reset:
-                # If target is in range and we already landed sprint hit, release W to reset sprint!
+                # 2. Movement heuristic with W-Tap sprint reset and distance spacing:
+                target_h = det.get("box_h", 0.0)
                 if det["in_attack_range"] and self.reward_engine.consecutive_sprint_hits >= 1 and random.random() < 0.45:
                     move_act = 0  # Release W briefly -> resets sprint counter for another +40 KB hit!
+                elif target_h > 290 and random.random() < 0.40:
+                    # Too close (< 1.5 blocks)! Back up or circle-strafe to regain distance
+                    move_act = 5 if random.random() < 0.5 else 3  # Back S or Strafe A
                 elif self.reward_engine.sprint_reset_ready:
                     move_act = 2  # Sprint W to deliver high-knockback hit!
                 else:
@@ -241,7 +277,7 @@ class RLPvpAgent:
                 # 3. Jump heuristic for Critical Hits
                 jump_act = 1 if (det["in_attack_range"] and random.random() < 0.35) else 0
 
-                # 4. Anti-spam attack heuristic: Only attack when weapon cooldown is >= 85%!
+                # 4. Anti-spam & Distance attack heuristic: Only attack when weapon cooldown is >= 85%!
                 charge = self.reward_engine.get_attack_cooldown_charge()
                 atk_act = 1 if (det["in_attack_range"] and charge >= 0.85) else 0
 
@@ -400,12 +436,8 @@ class RLPvpAgent:
                         self.prev_state_tensor = state_arr
                         self.prev_action_tuple = action_tuple
 
-                        # 7. Train on GPU
+                        # 7. Step counter & Epsilon decay (GPU training runs non-blocking in background)
                         self.step_count += 1
-                        if self.step_count % 2 == 0:
-                            self.train_step(batch_size=32)
-
-                        # Decay exploration
                         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
                     else:
                         action_dict = {}
@@ -443,9 +475,10 @@ class RLPvpAgent:
                         hit_color = (
                             (0, 255, 0) if "knockback" in ht
                             else ((0, 255, 255) if "critical" in ht
+                            else ((255, 215, 0) if "dist" in ht
                             else ((0, 0, 255) if "spam" in ht
                             else ((200, 200, 0) if "sweep" in ht
-                            else (200, 200, 200))))
+                            else (200, 200, 200)))))
                         )
                         cv2.putText(hud, f"EVENT: {ht.upper()}!", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.65, hit_color, 2)
 
@@ -463,6 +496,7 @@ class RLPvpAgent:
         except KeyboardInterrupt:
             print("\n[+] Stop signal received.", flush=True)
         finally:
+            self.async_trainer.stop()
             self.killswitch.stop()
             self.input_ctrl.release_all()
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)

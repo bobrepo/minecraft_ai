@@ -5,9 +5,12 @@ Minecraft 1.9–1.21 Combat Mechanics & RL Reward Rubric:
 Event / Action               | Condition                                 | RL Reward   | Description
 -----------------------------+-------------------------------------------+-------------+--------------------------------------------
 Knockback (KB) Hit           | Sprint hit with reset ready (1st W hit)   | +40.0 pts   | Highest reward; initiates combo & pushes back
+Max-Reach Distance Hit Bonus | Hit landed from 2.6-3.0 blocks distance   | +15.0 pts   | Out-spacing bonus added on top of any hit
 Critical Hit                 | Hit landed while falling (ticks 5-11 post | +25.0 pts   | 150% damage + golden star particles
 Sweep Hit                    | Grounded hit / consecutive sprint hit     | +10.0 pts   | Base damage sweep hit
 W-Tap Sprint Reset           | Release W >=2 ticks then re-engage        |  +5.0 pts   | Resets sprint counter for subsequent KB hit
+Distance Attack Swing        | Attack swing initiated at 2.6-3.0 blocks  |  +2.5 pts   | Reward for attacking with spacing discipline
+Overcrowded Attack Penalty   | Attack swing while crowded (<1.5 blocks)  |  -2.0 pts   | Penalizes face-hugging inside enemy hitbox
 Spam Attack Penalty          | Attack when weapon cooldown < 85%         |  -8.0 pts   | Heavy penalty for spam-clicking without timing
 Whiff / Miss Swing           | Attack when target not in 3-block reach   |  -3.0 pts   | Penalizes swinging at empty air
 Optimal 3-Block Spacing      | Enemy box height 170-270 px               |  +2.0 /tick | Ideal melee reach distance spacing
@@ -174,6 +177,7 @@ class PvPRewardEngine:
         r_dodge = 0.0
         r_wtap = 0.0
         r_spam = 0.0
+        r_dist_atk = 0.0
         r_hit = 0.0
         hit_type = "none"
 
@@ -209,28 +213,40 @@ class PvPRewardEngine:
             if action_flags.get("w_tap_reset") and det["in_attack_range"]:
                 r_wtap = 5.0
 
-            # 6. Hit Detection via Red Hurt-Tint
+            # 6. Distance Attack Reward: reward swinging from safe maximum reach (~2.6 - 3.0 blocks)
+            # In 640x480, height between 150px and 220px represents maximum melee reach
+            if actions.get("attack") and det["in_attack_range"]:
+                if 150 <= target_h <= 220:
+                    r_dist_atk = 2.5  # Reward disciplined spacing when attacking
+                elif target_h > 310:
+                    r_dist_atk = -2.0  # Penalty for face-hugging / overcrowded attacks
+
+            # 7. Hit Detection via Red Hurt-Tint
             # Triggered if attack was executed within last 4 ticks and enemy flashes red
             enemy_damaged = self.detect_hurt_tint(frame, det)
 
             if enemy_damaged and self.hurt_cooldown_counter == 0 and self.attack_tick_counter <= 4:
                 self.hurt_cooldown_counter = 8  # Debounce consecutive frames of same flash
 
+                # Check if hit was landed from maximum reach distance
+                is_distance_hit = (150 <= target_h <= 220)
+                dist_hit_bonus = 15.0 if is_distance_hit else 0.0
+
                 if self.is_falling():
-                    r_hit = 25.0  # Critical Falling Hit!
-                    hit_type = "critical_hit"
+                    r_hit = 25.0 + dist_hit_bonus  # Critical Falling Hit (+ distance bonus)
+                    hit_type = "dist_critical_hit" if is_distance_hit else "critical_hit"
                 elif actions.get("sprint") and actions.get("w"):
                     if self.sprint_reset_ready or self.consecutive_sprint_hits == 0:
-                        r_hit = 40.0  # Knockback Sprint Hit (first hit of sprint burst)!
-                        hit_type = "knockback_hit"
+                        r_hit = 40.0 + dist_hit_bonus  # Knockback Sprint Hit (+ distance bonus)
+                        hit_type = "dist_knockback_hit" if is_distance_hit else "knockback_hit"
                         self.sprint_reset_ready = False
                         self.consecutive_sprint_hits += 1
                     else:
-                        r_hit = 10.0  # Subsequent Sweep Hit (W held without resetting)
-                        hit_type = "sweep_hit"
+                        r_hit = 10.0 + dist_hit_bonus  # Subsequent Sweep Hit (+ distance bonus)
+                        hit_type = "dist_sweep_hit" if is_distance_hit else "sweep_hit"
                 else:
-                    r_hit = 10.0  # Normal Sweep Hit!
-                    hit_type = "sweep_hit"
+                    r_hit = 10.0 + dist_hit_bonus  # Normal Sweep Hit (+ distance bonus)
+                    hit_type = "dist_sweep_hit" if is_distance_hit else "sweep_hit"
 
             # Whiff penalty: attacking when enemy is not within 3-block reach
             elif actions.get("attack") and not det["in_attack_range"]:
@@ -246,7 +262,7 @@ class PvPRewardEngine:
                 if hit_type == "none":
                     hit_type = "whiff"
 
-        total_reward = float(r_aim + r_dist + r_dodge + r_wtap + r_spam + r_hit)
+        total_reward = float(r_aim + r_dist + r_dodge + r_wtap + r_spam + r_dist_atk + r_hit)
 
         return {
             "reward": total_reward,
@@ -255,6 +271,7 @@ class PvPRewardEngine:
             "r_dodge": float(r_dodge),
             "r_wtap": float(r_wtap),
             "r_spam": float(r_spam),
+            "r_dist_atk": float(r_dist_atk),
             "r_hit": float(r_hit),
             "hit_type": hit_type,
             "is_falling": self.is_falling(),
