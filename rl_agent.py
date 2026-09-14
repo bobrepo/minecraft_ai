@@ -290,17 +290,14 @@ class RLPvpAgent:
                 else:
                     aim_act = 0  # Dead-center hold
 
-                # 2. Movement heuristic with W-Tap sprint reset and distance spacing:
+                # 2. Movement heuristic: Direct pursuit without W-tap stutter or strafe wiggling
                 target_h = det.get("box_h", 0.0)
-                if det["in_attack_range"] and self.reward_engine.consecutive_sprint_hits >= 1 and random.random() < 0.45:
-                    move_act = 0  # Release W briefly -> resets sprint counter for another +40 KB hit!
-                elif target_h > 290 and random.random() < 0.40:
-                    # Too close (< 1.5 blocks)! Back up or circle-strafe to regain distance
-                    move_act = 5 if random.random() < 0.5 else 3  # Back S or Strafe A
-                elif self.reward_engine.sprint_reset_ready:
-                    move_act = 2  # Sprint W to deliver high-knockback hit!
+                if target_h > 310:
+                    # Too close / crowded inside enemy hitbox (< 1.5 blocks)! Back up
+                    move_act = 5  # Back S
                 else:
-                    move_act = 2 if random.random() < 0.70 else 3  # Sprint or circle-strafe
+                    # Maintain direct sprint W toward target to keep crosshair aligned
+                    move_act = 2  # Sprint W
 
                 # 3. Disciplined Jump Heuristic for Critical Hits:
                 # Anti-bunny-hop: ONLY jump when fully grounded (jump_tick_counter >= 12)

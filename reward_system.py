@@ -1,27 +1,23 @@
 """Visual Reward Engine & Mechanics Rubric for Minecraft PvP Reinforcement Learning.
 
-Minecraft 1.9–1.21 Combat Mechanics & Aim-Dominant RL Reward Rubric:
+Minecraft 1.9–1.21 Combat Mechanics & Pure Aim-Centric Reward Rubric:
 ====================================================================================================
 Event / Action               | Condition                                 | RL Reward   | Description
 -----------------------------+-------------------------------------------+-------------+--------------------------------------------
-Dead-Center Crosshair Lock   | Target center <= 35px from crosshair      | +15.0 /tick | Dominant reward: keeps crosshair locked on enemy
+Dead-Center Crosshair Lock   | Target center <= 35px from crosshair      | +15.0 /tick | Pure Aim: keeps crosshair locked on enemy
 On-Body Aim Tracking         | Target distance 35px - 80px               | +8.0-+15.0  | Smooth gradient tracking on target body
 In-Frame Pursuit Aim         | Target distance 80px - 180px              | +2.0-+8.0   | Smooth guidance toward crosshair center
-Predictive Target Intercept  | Re-acquires target after trajectory loss  |  +6.0 pts   | Reward for predicting & intercepting target
-Predictive Search Guidance   | Steers toward predicted target location   |  +1.0 /tick | Encourages following extrapolated target path
+Predictive Target Intercept  | Re-acquires target after trajectory loss  |  +6.0 pts   | Reward for predicting & looking at target
+Predictive Search Guidance   | Steers toward predicted target location   |  +1.0 /tick | Encourages turning toward fleeing enemy
 Off-Target / Lost Penalty    | Distance > 180px or spinning blindly      | -0.5--1.0   | Punishes looking away from opponent
-Knockback (KB) Hit           | Sprint hit with reset ready (1st W hit)   |  +4.0 pts   | Initiates combo & resets sprint counter
-Critical Hit                 | Hit landed while falling (ticks 5-11)     |  +2.5 pts   | 150% damage critical strike
-Sweep Hit                    | Grounded hit / consecutive sprint hit     |  +1.0 pt    | Base damage sweep hit
-Max-Reach Distance Hit Bonus | Hit landed from 2.6-3.0 blocks distance   |  +1.5 pts   | Out-spacing bonus added on top of any hit
-Optimal 3-Block Spacing      | Enemy box height 170-270 px               |  +0.5 /tick | Ideal melee reach distance spacing
-W-Tap Sprint Reset           | Release W >=2 ticks then re-engage        |  +0.5 pt    | Resets sprint counter for subsequent KB hit
-Distance Attack Swing        | Attack swing initiated at 2.6-3.0 blocks  |  +0.5 pt    | Reward for disciplined reach spacing
-Evasive Circle-Strafing      | Lateral movement (A or D) in combat       |  +0.2 /tick | Circle-strafing to dodge incoming attacks
 Spam Attack Penalty          | Attack when weapon cooldown < 85%         |  -2.0 pts   | Penalizes spam-clicking without timing
 Anti-Bunny-Hop Jump Spam     | Repeated mid-air jump / uncharged jump    |  -2.0 pts   | Penalizes jump spam without critical timing
 Whiff / Miss Swing           | Attack when target not in 3-block reach   |  -1.0 pt    | Penalizes swinging at empty air
-Spacing Violation            | Box height <120px or >320px               |  -0.2 /tick | Too far away or crowded inside enemy
+Spacing Violation            | Box height > 320px (overcrowded inside)   |  -0.2 /tick | Penalizes face-hugging inside hitbox
+W-Tap Sprint Reset           | Any W release / re-engage                 |   0.0 pts   | NO REWARD (disabled per user request)
+Evasive Circle-Strafing      | Lateral movement (A or D)                 |   0.0 /tick | NO REWARD (disabled per user request)
+Distance Attack Swing        | Attack swing initiated at distance        |   0.0 pts   | NO REWARD (disabled per user request)
+Attack Hits (KB/Crit/Sweep)  | Confirmed damage hits on enemy            |   0.0 pts   | Badge only (all rewards for looking at enemy)
 ====================================================================================================
 """
 
@@ -411,54 +407,40 @@ class PvPRewardEngine:
                     hit_type = "pred_acquisition"
 
             # 4. Optimal Spacing (~3 blocks reach distance, scaled down to +0.5)
-            target_h = det["box_h"]
+            # 4. Spacing Penalty if overcrowded (no positive spacing reward)
+            target_h = det.get("box_h", 0.0)
             self.last_target_height = target_h
+            if target_h > 320:
+                r_dist = -0.2  # Spacing penalty for face-hugging inside hitbox
+            else:
+                r_dist = 0.0
 
-            if 170 <= target_h <= 270:
-                r_dist = 0.5  # Ideal spacing
-            elif target_h < 120 or target_h > 320:
-                r_dist = -0.2  # Spacing violation
+            # 5. NO REWARD for strafe dodge, W-tap, or distance swing (strictly 0.0 per user request)
+            r_dodge = 0.0
+            r_wtap = 0.0
+            r_dist_atk = 0.0
 
-            # 5. Evasive Circle-Strafing (scaled down to +0.2)
-            if det["in_attack_range"] and (actions.get("a") or actions.get("d")):
-                r_dodge = 0.2
-
-            # 6. W-Tap Reset Reward (scaled down to +0.5)
-            if action_flags.get("w_tap_reset") and det["in_attack_range"]:
-                r_wtap = 0.5
-
-            # 7. Distance Attack Swing (scaled down to +0.5)
-            if actions.get("attack") and det["in_attack_range"]:
-                if 150 <= target_h <= 220:
-                    r_dist_atk = 0.5
-                elif target_h > 310:
-                    r_dist_atk = -0.5
-
-            # 8. Hit Detection via Red Hurt-Tint (scaled down to baseline values)
+            # 6. Hit Detection for Badges & Audio/Visual Feedback (r_hit = 0.0; rewards strictly for looking)
             enemy_damaged = self.detect_hurt_tint(frame, det)
 
             if enemy_damaged and self.hurt_cooldown_counter == 0 and self.attack_tick_counter <= 4:
                 self.hurt_cooldown_counter = 8  # Debounce hurt flash
                 is_distance_hit = (150 <= target_h <= 220)
-                dist_hit_bonus = 1.5 if is_distance_hit else 0.0
 
                 if self.is_falling():
-                    r_hit = 2.5 + dist_hit_bonus  # Critical Falling Hit
                     hit_type = "dist_critical_hit" if is_distance_hit else "critical_hit"
                 elif actions.get("sprint") and actions.get("w"):
                     if self.sprint_reset_ready or self.consecutive_sprint_hits == 0:
-                        r_hit = 4.0 + dist_hit_bonus  # Knockback Sprint Hit
                         hit_type = "dist_knockback_hit" if is_distance_hit else "knockback_hit"
                         self.sprint_reset_ready = False
                         self.consecutive_sprint_hits += 1
                     else:
-                        r_hit = 1.0 + dist_hit_bonus  # Consecutive Sweep Hit
                         hit_type = "dist_sweep_hit" if is_distance_hit else "sweep_hit"
                 else:
-                    r_hit = 1.0 + dist_hit_bonus  # Normal Sweep Hit
                     hit_type = "dist_sweep_hit" if is_distance_hit else "sweep_hit"
+                r_hit = 0.0
 
-            elif actions.get("attack") and not det["in_attack_range"]:
+            elif actions.get("attack") and not det.get("in_attack_range", False):
                 r_hit = -1.0
                 if hit_type == "none":
                     hit_type = "whiff"
