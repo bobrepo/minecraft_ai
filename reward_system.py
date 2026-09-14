@@ -1,36 +1,227 @@
 """Visual Reward Engine & Mechanics Rubric for Minecraft PvP Reinforcement Learning.
 
-Minecraft 1.9–1.21 Combat Mechanics & RL Reward Rubric:
+Minecraft 1.9–1.21 Combat Mechanics & Aim-Dominant RL Reward Rubric:
 ====================================================================================================
 Event / Action               | Condition                                 | RL Reward   | Description
 -----------------------------+-------------------------------------------+-------------+--------------------------------------------
-Knockback (KB) Hit           | Sprint hit with reset ready (1st W hit)   | +40.0 pts   | Highest reward; initiates combo & pushes back
-Max-Reach Distance Hit Bonus | Hit landed from 2.6-3.0 blocks distance   | +15.0 pts   | Out-spacing bonus added on top of any hit
-Critical Hit                 | Hit landed while falling (ticks 5-11 post | +25.0 pts   | 150% damage + golden star particles
-Sweep Hit                    | Grounded hit / consecutive sprint hit     | +10.0 pts   | Base damage sweep hit
-W-Tap Sprint Reset           | Release W >=2 ticks then re-engage        |  +5.0 pts   | Resets sprint counter for subsequent KB hit
-Distance Attack Swing        | Attack swing initiated at 2.6-3.0 blocks  |  +2.5 pts   | Reward for attacking with spacing discipline
-Overcrowded Attack Penalty   | Attack swing while crowded (<1.5 blocks)  |  -2.0 pts   | Penalizes face-hugging inside enemy hitbox
-Spam Attack Penalty          | Attack when weapon cooldown < 85%         |  -8.0 pts   | Heavy penalty for spam-clicking without timing
-Whiff / Miss Swing           | Attack when target not in 3-block reach   |  -3.0 pts   | Penalizes swinging at empty air
-Optimal 3-Block Spacing      | Enemy box height 170-270 px               |  +2.0 /tick | Ideal melee reach distance spacing
-Spacing Violation            | Box height <120px or >320px               |  -0.5 /tick | Too far away or crowded inside enemy
-Aim Alignment Tracking       | Crosshair within 140px radius of target   |0.0-+2.0/tick| Continuous crosshair tracking on enemy
-Evasive Circle-Strafing      | Lateral movement (A or D) in combat       |  +0.5 /tick | Circle-strafing to dodge incoming attacks
+Dead-Center Crosshair Lock   | Target center <= 35px from crosshair      | +15.0 /tick | Dominant reward: keeps crosshair locked on enemy
+On-Body Aim Tracking         | Target distance 35px - 80px               | +8.0-+15.0  | Smooth gradient tracking on target body
+In-Frame Pursuit Aim         | Target distance 80px - 180px              | +2.0-+8.0   | Smooth guidance toward crosshair center
+Predictive Target Intercept  | Re-acquires target after trajectory loss  |  +6.0 pts   | Reward for predicting & intercepting target
+Predictive Search Guidance   | Steers toward predicted target location   |  +1.0 /tick | Encourages following extrapolated target path
+Off-Target / Lost Penalty    | Distance > 180px or spinning blindly      | -0.5--1.0   | Punishes looking away from opponent
+Knockback (KB) Hit           | Sprint hit with reset ready (1st W hit)   |  +4.0 pts   | Initiates combo & resets sprint counter
+Critical Hit                 | Hit landed while falling (ticks 5-11)     |  +2.5 pts   | 150% damage critical strike
+Sweep Hit                    | Grounded hit / consecutive sprint hit     |  +1.0 pt    | Base damage sweep hit
+Max-Reach Distance Hit Bonus | Hit landed from 2.6-3.0 blocks distance   |  +1.5 pts   | Out-spacing bonus added on top of any hit
+Optimal 3-Block Spacing      | Enemy box height 170-270 px               |  +0.5 /tick | Ideal melee reach distance spacing
+W-Tap Sprint Reset           | Release W >=2 ticks then re-engage        |  +0.5 pt    | Resets sprint counter for subsequent KB hit
+Distance Attack Swing        | Attack swing initiated at 2.6-3.0 blocks  |  +0.5 pt    | Reward for disciplined reach spacing
+Evasive Circle-Strafing      | Lateral movement (A or D) in combat       |  +0.2 /tick | Circle-strafing to dodge incoming attacks
+Spam Attack Penalty          | Attack when weapon cooldown < 85%         |  -2.0 pts   | Penalizes spam-clicking without timing
+Anti-Bunny-Hop Jump Spam     | Repeated mid-air jump / uncharged jump    |  -2.0 pts   | Penalizes jump spam without critical timing
+Whiff / Miss Swing           | Attack when target not in 3-block reach   |  -1.0 pt    | Penalizes swinging at empty air
+Spacing Violation            | Box height <120px or >320px               |  -0.2 /tick | Too far away or crowded inside enemy
 ====================================================================================================
 """
 
+import math
 from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 
+class TargetTrajectoryPredictor:
+    """Predicts target trajectory, maintains spatial memory map, and extrapolates positions when target leaves view."""
+
+    def __init__(self, resolution: Tuple[int, int] = (640, 480)):
+        self.width, self.height = resolution
+        self.cx = self.width / 2.0
+        self.cy = self.height / 2.0
+
+        self.vx = 0.0
+        self.vy = 0.0
+        self.prev_x: Optional[float] = None
+        self.prev_y: Optional[float] = None
+        self.last_seen_x: Optional[float] = None
+        self.last_seen_y: Optional[float] = None
+        self.last_seen_h: float = 0.0
+        self.ticks_lost: int = 999
+        self.confidence: float = 0.0
+        self.predicted_pos: Optional[Tuple[float, float]] = None
+        self.was_tracking: bool = False
+
+    def update(self, det: Dict[str, Any]) -> Dict[str, Any]:
+        """Update tracker with latest visual detection frame and return trajectory prediction."""
+        if det.get("has_target", False):
+            cur_x = float(det["target_x"])
+            cur_y = float(det["target_y"])
+
+            # Check if target was re-acquired along predicted trajectory
+            reacquired_predicted = False
+            if 0 < self.ticks_lost <= 20 and self.predicted_pos is not None:
+                pred_dist = math.hypot(cur_x - self.predicted_pos[0], cur_y - self.predicted_pos[1])
+                # Within 140px of predicted position indicates successful predictive intercept
+                if pred_dist < 140.0:
+                    reacquired_predicted = True
+
+            # Calculate smoothed velocity with exponential moving average (EMA)
+            if self.was_tracking and self.prev_x is not None and self.prev_y is not None:
+                raw_vx = cur_x - self.prev_x
+                raw_vy = cur_y - self.prev_y
+                self.vx = 0.45 * raw_vx + 0.55 * self.vx
+                self.vy = 0.45 * raw_vy + 0.55 * self.vy
+            else:
+                self.vx = 0.0
+                self.vy = 0.0
+
+            self.last_seen_x = cur_x
+            self.last_seen_y = cur_y
+            self.last_seen_h = float(det.get("box_h", 0.0))
+            self.prev_x = cur_x
+            self.prev_y = cur_y
+            self.ticks_lost = 0
+            self.confidence = 1.0
+            self.was_tracking = True
+            self.predicted_pos = (cur_x + self.vx, cur_y + self.vy)
+
+            return {
+                "is_predicting": False,
+                "has_target": True,
+                "reacquired_predicted": reacquired_predicted,
+                "vx": self.vx,
+                "vy": self.vy,
+                "speed": float(math.hypot(self.vx, self.vy)),
+                "pred_pos": (cur_x, cur_y),
+                "pred_dx": float(det["dx"]),
+                "pred_dy": float(det["dy"]),
+                "confidence": 1.0,
+                "ticks_lost": 0,
+                "direction": self._get_direction_name(det["dx"], det["dy"]),
+            }
+        else:
+            self.was_tracking = False
+            self.ticks_lost += 1
+            self.prev_x = None
+            self.prev_y = None
+
+            # Confidence decays linearly over 18 ticks (~0.90s)
+            self.confidence = max(0.0, 1.0 - (self.ticks_lost / 18.0))
+
+            if self.ticks_lost <= 18 and self.last_seen_x is not None and self.last_seen_y is not None:
+                # Damped linear trajectory extrapolation
+                damping = max(0.2, 1.0 - (self.ticks_lost * 0.04))
+                extrap_x = self.last_seen_x + (self.vx * self.ticks_lost * damping)
+                extrap_y = self.last_seen_y + (self.vy * self.ticks_lost * damping)
+                self.predicted_pos = (extrap_x, extrap_y)
+                pred_dx = extrap_x - self.cx
+                pred_dy = extrap_y - self.cy
+
+                return {
+                    "is_predicting": True,
+                    "has_target": False,
+                    "reacquired_predicted": False,
+                    "vx": self.vx,
+                    "vy": self.vy,
+                    "speed": float(math.hypot(self.vx, self.vy)),
+                    "pred_pos": (extrap_x, extrap_y),
+                    "pred_dx": float(pred_dx),
+                    "pred_dy": float(pred_dy),
+                    "confidence": float(self.confidence),
+                    "ticks_lost": self.ticks_lost,
+                    "direction": self._get_direction_name(pred_dx, pred_dy),
+                }
+            else:
+                self.predicted_pos = None
+                return {
+                    "is_predicting": False,
+                    "has_target": False,
+                    "reacquired_predicted": False,
+                    "vx": 0.0,
+                    "vy": 0.0,
+                    "speed": 0.0,
+                    "pred_pos": None,
+                    "pred_dx": 0.0,
+                    "pred_dy": 0.0,
+                    "confidence": 0.0,
+                    "ticks_lost": self.ticks_lost,
+                    "direction": "CENTER",
+                }
+
+    def get_current_state(self) -> Dict[str, Any]:
+        """Return the current trajectory state without incrementing counters."""
+        if self.ticks_lost == 0 and self.last_seen_x is not None and self.last_seen_y is not None:
+            return {
+                "is_predicting": False,
+                "has_target": True,
+                "vx": self.vx,
+                "vy": self.vy,
+                "confidence": 1.0,
+                "ticks_lost": 0,
+                "pred_dx": self.last_seen_x - self.cx,
+                "pred_dy": self.last_seen_y - self.cy,
+                "direction": self._get_direction_name(self.last_seen_x - self.cx, self.last_seen_y - self.cy),
+            }
+        elif self.ticks_lost <= 18 and self.predicted_pos is not None:
+            pred_dx = self.predicted_pos[0] - self.cx
+            pred_dy = self.predicted_pos[1] - self.cy
+            return {
+                "is_predicting": True,
+                "has_target": False,
+                "vx": self.vx,
+                "vy": self.vy,
+                "confidence": self.confidence,
+                "ticks_lost": self.ticks_lost,
+                "pred_dx": pred_dx,
+                "pred_dy": pred_dy,
+                "direction": self._get_direction_name(pred_dx, pred_dy),
+            }
+        else:
+            return {
+                "is_predicting": False,
+                "has_target": False,
+                "vx": 0.0,
+                "vy": 0.0,
+                "confidence": 0.0,
+                "ticks_lost": self.ticks_lost,
+                "pred_dx": 0.0,
+                "pred_dy": 0.0,
+                "direction": "CENTER",
+            }
+
+    def _get_direction_name(self, dx: float, dy: float) -> str:
+        """Map screen offset vector to 8-cardinal direction string."""
+        if abs(dx) < 18 and abs(dy) < 18:
+            return "CENTER"
+        ang = math.degrees(math.atan2(dy, dx))
+        if -22.5 <= ang < 22.5:
+            return "RIGHT"
+        elif 22.5 <= ang < 67.5:
+            return "DOWN-RIGHT"
+        elif 67.5 <= ang < 112.5:
+            return "DOWN"
+        elif 112.5 <= ang < 157.5:
+            return "DOWN-LEFT"
+        elif ang >= 157.5 or ang < -157.5:
+            return "LEFT"
+        elif -157.5 <= ang < -112.5:
+            return "UP-LEFT"
+        elif -112.5 <= ang < -67.5:
+            return "UP"
+        elif -67.5 <= ang < -22.5:
+            return "UP-RIGHT"
+        return "CENTER"
+
+
 class PvPRewardEngine:
-    """Calculates reinforcement learning rewards from visual perception and player state."""
+    """Calculates aim-dominant reinforcement learning rewards with target trajectory prediction."""
 
     def __init__(self, resolution: Tuple[int, int] = (640, 480)):
         self.width, self.height = resolution
         self.crosshair_x = self.width // 2
         self.crosshair_y = self.height // 2
+
+        # Target Trajectory Predictor & Spatial Memory Map
+        self.predictor = TargetTrajectoryPredictor(resolution)
 
         # Jump & Falling Physics Tracker (Minecraft 20 TPS physics: ~12 ticks jump cycle)
         self.jump_tick_counter: int = 999  # Ticks since Space jump
@@ -133,10 +324,10 @@ class PvPRewardEngine:
         if not det["has_target"]:
             return False
 
-        tx = int(det["target_x"])
-        ty = int(det["target_y"])
-        bw = max(20, int(det["box_w"] * 0.7))
-        bh = max(30, int(det["box_h"] * 0.6))
+        tx = int(det.get("target_x", self.width // 2))
+        ty = int(det.get("target_y", self.height // 2))
+        bw = max(20, int(det.get("box_w", 60) * 0.7))
+        bh = max(30, int(det.get("box_h", 120) * 0.6))
 
         x1 = max(0, tx - bw // 2)
         y1 = max(0, ty - bh // 2)
@@ -165,21 +356,15 @@ class PvPRewardEngine:
         actions: Dict[str, Any],
         action_flags: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Compute scalar reward and detailed event breakdown for the current tick.
-
-        Args:
-            frame: Current 640x480 screen frame.
-            det: VisionDetector dictionary.
-            actions: Dictionary of current actions (w, s, a, d, sprint, jump, attack, dx, dy).
-            action_flags: Optional dictionary returned by record_action().
-
-        Returns:
-            Dictionary with total reward and individual reward components.
-        """
+        """Compute scalar reward with aim-dominant weighting and predictive trajectory tracking."""
         if action_flags is None:
             action_flags = {}
 
+        # Update target trajectory predictor
+        pred_info = self.predictor.update(det)
+
         r_aim = 0.0
+        r_pred = 0.0
         r_dist = 0.0
         r_dodge = 0.0
         r_wtap = 0.0
@@ -189,106 +374,134 @@ class PvPRewardEngine:
         r_jump_spam = 0.0
         hit_type = "none"
 
-        # 1. Anti-Spam Click Penalty
+        # 1. Anti-Spam Click Penalty (scaled to -2.0)
         if action_flags.get("spam_attack"):
-            r_spam = -8.0
+            r_spam = -2.0
             hit_type = "spam_penalty"
 
-        # Anti-Bunny-Hop Jump Spam Penalty:
-        # Penalizes jumping repeatedly in mid-air or jumping while weapon is still recharging (<85%)
+        # Anti-Bunny-Hop Jump Spam Penalty (-2.0)
         if action_flags.get("jump_spam"):
             r_jump_spam = -2.0
             if hit_type == "none":
                 hit_type = "jump_spam_penalty"
 
         if det["has_target"]:
-            # 2. High Aim Centering & Enemy Tracking Reward
+            # 2. Dominant Aim Centering & Looking-at-Enemy Reward
             # Rewarded highly for looking directly at the enemy and keeping crosshair centered!
             dist_to_ch = np.hypot(det["dx"], det["dy"])
             if dist_to_ch <= 35:
-                r_aim = 10.0  # Bullseye tracking: crosshair dead-center on enemy!
+                r_aim = 15.0  # Bullseye tracking: crosshair locked dead-center! (+300 pts/sec)
             elif dist_to_ch <= 80:
-                # On target body: smooth gradient between +6.0 and +10.0
-                r_aim = 6.0 + 4.0 * (1.0 - (dist_to_ch - 35.0) / 45.0)
+                # On target body: smooth interpolation between +15.0 and +8.0
+                t = (dist_to_ch - 35.0) / 45.0
+                r_aim = 15.0 - 7.0 * t
+            elif dist_to_ch <= 180:
+                # In-frame pursuit: smooth decay from +8.0 down to +2.0
+                t = (dist_to_ch - 80.0) / 100.0
+                r_aim = 8.0 - 6.0 * t
             else:
-                # Approaching target: decays from +6.0 down to 0.0 at 180px
-                r_aim = max(0.0, 6.0 * (1.0 - (dist_to_ch - 80.0) / 100.0))
+                # Off-target penalty: target visible but looking away (> 180px)
+                r_aim = -1.0
 
-            # 3. Optimal Spacing (~3 blocks ideal distance)
-            # At 3 blocks, enemy height on 640x480 is ~170px to 270px
+            # 3. Predictive Target Re-Acquisition Bonus (+6.0 pts)
+            # Awarded when enemy is re-acquired along extrapolated trajectory
+            if pred_info.get("reacquired_predicted", False):
+                r_pred = 6.0
+                if hit_type == "none":
+                    hit_type = "pred_acquisition"
+
+            # 4. Optimal Spacing (~3 blocks reach distance, scaled down to +0.5)
             target_h = det["box_h"]
             self.last_target_height = target_h
 
             if 170 <= target_h <= 270:
-                r_dist = 2.0  # Sweet spot reach distance!
-            elif target_h < 120:
-                r_dist = -0.5  # Too far away
-            elif target_h > 320:
-                r_dist = -0.5  # Too close / crowded
+                r_dist = 0.5  # Ideal spacing
+            elif target_h < 120 or target_h > 320:
+                r_dist = -0.2  # Spacing violation
 
-            # 4. Evasive Dodging / Circle-Strafing
-            # Reward lateral motion (A or D) while engaged in combat
+            # 5. Evasive Circle-Strafing (scaled down to +0.2)
             if det["in_attack_range"] and (actions.get("a") or actions.get("d")):
-                r_dodge = 0.5
+                r_dodge = 0.2
 
-            # 5. W-Tap Reset Reward: rewarding player for resetting sprint during combat
+            # 6. W-Tap Reset Reward (scaled down to +0.5)
             if action_flags.get("w_tap_reset") and det["in_attack_range"]:
-                r_wtap = 5.0
+                r_wtap = 0.5
 
-            # 6. Distance Attack Reward: reward swinging from safe maximum reach (~2.6 - 3.0 blocks)
-            # In 640x480, height between 150px and 220px represents maximum melee reach
+            # 7. Distance Attack Swing (scaled down to +0.5)
             if actions.get("attack") and det["in_attack_range"]:
                 if 150 <= target_h <= 220:
-                    r_dist_atk = 2.5  # Reward disciplined spacing when attacking
+                    r_dist_atk = 0.5
                 elif target_h > 310:
-                    r_dist_atk = -2.0  # Penalty for face-hugging / overcrowded attacks
+                    r_dist_atk = -0.5
 
-            # 7. Hit Detection via Red Hurt-Tint
-            # Triggered if attack was executed within last 4 ticks and enemy flashes red
+            # 8. Hit Detection via Red Hurt-Tint (scaled down to baseline values)
             enemy_damaged = self.detect_hurt_tint(frame, det)
 
             if enemy_damaged and self.hurt_cooldown_counter == 0 and self.attack_tick_counter <= 4:
-                self.hurt_cooldown_counter = 8  # Debounce consecutive frames of same flash
-
-                # Check if hit was landed from maximum reach distance
+                self.hurt_cooldown_counter = 8  # Debounce hurt flash
                 is_distance_hit = (150 <= target_h <= 220)
-                dist_hit_bonus = 15.0 if is_distance_hit else 0.0
+                dist_hit_bonus = 1.5 if is_distance_hit else 0.0
 
                 if self.is_falling():
-                    r_hit = 25.0 + dist_hit_bonus  # Critical Falling Hit (+ distance bonus)
+                    r_hit = 2.5 + dist_hit_bonus  # Critical Falling Hit
                     hit_type = "dist_critical_hit" if is_distance_hit else "critical_hit"
                 elif actions.get("sprint") and actions.get("w"):
                     if self.sprint_reset_ready or self.consecutive_sprint_hits == 0:
-                        r_hit = 40.0 + dist_hit_bonus  # Knockback Sprint Hit (+ distance bonus)
+                        r_hit = 4.0 + dist_hit_bonus  # Knockback Sprint Hit
                         hit_type = "dist_knockback_hit" if is_distance_hit else "knockback_hit"
                         self.sprint_reset_ready = False
                         self.consecutive_sprint_hits += 1
                     else:
-                        r_hit = 10.0 + dist_hit_bonus  # Subsequent Sweep Hit (+ distance bonus)
+                        r_hit = 1.0 + dist_hit_bonus  # Consecutive Sweep Hit
                         hit_type = "dist_sweep_hit" if is_distance_hit else "sweep_hit"
                 else:
-                    r_hit = 10.0 + dist_hit_bonus  # Normal Sweep Hit (+ distance bonus)
+                    r_hit = 1.0 + dist_hit_bonus  # Normal Sweep Hit
                     hit_type = "dist_sweep_hit" if is_distance_hit else "sweep_hit"
 
-            # Whiff penalty: attacking when enemy is not within 3-block reach
             elif actions.get("attack") and not det["in_attack_range"]:
-                r_hit = -3.0
+                r_hit = -1.0
                 if hit_type == "none":
                     hit_type = "whiff"
 
         else:
-            # Searching penalty for spinning when nothing is visible
-            r_aim = -0.1
+            # Target NOT currently visible: check trajectory prediction
+            if pred_info.get("is_predicting", False) and pred_info.get("confidence", 0.0) > 0.15:
+                # Target recently lost: award predictive search guidance if steering along trajectory
+                act_dx = float(actions.get("dx", 0.0))
+                act_dy = float(actions.get("dy", 0.0))
+                act_mag = float(np.hypot(act_dx, act_dy))
+
+                if act_mag > 8.0:
+                    pred_dx = float(pred_info["pred_dx"])
+                    pred_dy = float(pred_info["pred_dy"])
+                    dot = (act_dx * pred_dx + act_dy * pred_dy) / (act_mag * (math.hypot(pred_dx, pred_dy) + 1e-6))
+                    if dot > 0.4:
+                        # Agent is actively steering camera in direction of predicted target!
+                        r_pred = 1.0 * pred_info["confidence"]
+                        r_aim = 0.0
+                        if hit_type == "none":
+                            hit_type = "pred_tracking"
+                    else:
+                        # Steering away from predicted target
+                        r_aim = -0.5
+                else:
+                    # Inactive while target was recently fleeing
+                    r_aim = -0.3
+            else:
+                # Fully lost and spinning without active prediction
+                r_aim = -0.5
+
             if actions.get("attack"):
-                r_hit = -3.0
+                r_hit = -1.0
                 if hit_type == "none":
                     hit_type = "whiff"
 
-        total_reward = float(r_aim + r_dist + r_dodge + r_wtap + r_spam + r_dist_atk + r_hit + r_jump_spam)
+        total_reward = float(r_aim + r_pred + r_dist + r_dodge + r_wtap + r_spam + r_dist_atk + r_hit + r_jump_spam)
 
         return {
             "reward": total_reward,
             "r_aim": float(r_aim),
+            "r_pred": float(r_pred),
             "r_dist": float(r_dist),
             "r_dodge": float(r_dodge),
             "r_wtap": float(r_wtap),
@@ -300,4 +513,5 @@ class PvPRewardEngine:
             "is_falling": self.is_falling(),
             "sprint_reset_ready": self.sprint_reset_ready,
             "cooldown_charge": self.get_attack_cooldown_charge(),
+            "prediction": pred_info,
         }

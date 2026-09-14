@@ -325,8 +325,12 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         # Target Sensing
                         locked = msg.get("target_locked", False)
                         dist = msg.get("target_dist", 0.0)
+                        predicting = msg.get("predicting", False)
+                        pred_dir = msg.get("pred_direction", "CENTER")
                         if locked:
                             target_lbl.config(text=f"Target: 🎯 {dist:.1f} blk", fg="#22c55e")
+                        elif predicting:
+                            target_lbl.config(text=f"Target: ⤑ {pred_dir}", fg="#06b6d4")
                         else:
                             target_lbl.config(text="Target: 🔍 SCANNING", fg="#a1a1aa")
 
@@ -342,12 +346,16 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         if ht and ht != "none":
                             state["event_text"] = ht.upper().replace("_", " ")
                             state["event_timer"] = 24
-                            state["event_color"] = (
-                                "#ef4444" if "knockback" in ht
-                                else ("#a855f7" if "crit" in ht
-                                else ("#22c55e" if "dist" in ht
-                                else "#eab308"))
-                            )
+                            if "knockback" in ht:
+                                state["event_color"] = "#ef4444"
+                            elif "crit" in ht:
+                                state["event_color"] = "#a855f7"
+                            elif "dist" in ht:
+                                state["event_color"] = "#22c55e"
+                            elif "pred" in ht:
+                                state["event_color"] = "#06b6d4"
+                            else:
+                                state["event_color"] = "#eab308"
 
         except Exception:
             pass
@@ -428,6 +436,8 @@ class PvPOverlayClient:
         target_dist: float = 0.0,
         cooldown: float = 1.0,
         hit_type: str = "none",
+        predicting: bool = False,
+        pred_direction: str = "CENTER",
     ):
         """Enqueue state update for overlay rendering (takes <0.005ms)."""
         if not self._is_running:
@@ -449,6 +459,8 @@ class PvPOverlayClient:
             "target_dist": target_dist,
             "cooldown": cooldown,
             "hit_type": hit_type,
+            "predicting": predicting,
+            "pred_direction": pred_direction,
         }
         try:
             self._data_queue.put_nowait(msg)

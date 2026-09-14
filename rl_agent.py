@@ -314,6 +314,13 @@ class RLPvpAgent:
 
                 return aim_act, move_act, jump_act, atk_act
             else:
+                # Target not visible: check if spatial memory has an active extrapolated trajectory
+                pred_state = self.reward_engine.predictor.get_current_state()
+                if pred_state.get("is_predicting") and pred_state.get("confidence", 0.0) > 0.20 and random.random() < 0.85:
+                    # Trajectory-guided pursuit: actively steer toward extrapolated location
+                    aim_act = 4  # Predictive intercept
+                    move_act = 2 if pred_state["ticks_lost"] < 8 else 1  # Sprint/walk toward target
+                    return aim_act, move_act, 0, 0
                 return (
                     random.randint(0, 6),
                     random.randint(0, 5),
@@ -341,6 +348,8 @@ class RLPvpAgent:
             cur_dy = float(det["dy"])
             d_dx = cur_dx - self.prev_dx
             d_dy = cur_dy - self.prev_dy
+            pvx = self.reward_engine.predictor.vx
+            pvy = self.reward_engine.predictor.vy
 
             if aim_act == 1:
                 # Fast Snap: rapid target acquisition along true 360° vector
@@ -355,9 +364,9 @@ class RLPvpAgent:
                 ax = cur_dx * 0.28
                 ay = cur_dy * 0.28
             elif aim_act == 4:
-                # Predictive Lead: leads moving enemy based on velocity
-                ax = (cur_dx * 0.50) + (d_dx * 0.25)
-                ay = (cur_dy * 0.50) + (d_dy * 0.25)
+                # Predictive Lead: leads moving enemy based on both delta and smoothed velocity!
+                ax = (cur_dx * 0.50) + (pvx * 0.40)
+                ay = (cur_dy * 0.50) + (pvy * 0.40)
             elif aim_act == 5:
                 # Rotational search left
                 ax, ay = -45.0, 0.0
@@ -380,8 +389,22 @@ class RLPvpAgent:
             self.prev_dx = cur_dx
             self.prev_dy = cur_dy
         else:
-            # Target not in view: omnidirectional search sweeps (diagonals & horizontals)
-            dx, dy = self.AIM_DELTAS[aim_act]
+            # Target NOT in view: check spatial memory trajectory predictor
+            pred_state = self.reward_engine.predictor.get_current_state()
+            if pred_state.get("is_predicting") and pred_state.get("confidence", 0.0) > 0.15:
+                # Steer camera smoothly along predicted intercept vector ("look at there")!
+                p_dx = float(pred_state["pred_dx"])
+                p_dy = float(pred_state["pred_dy"])
+                ang = math.atan2(p_dy, p_dx)
+                dist = math.hypot(p_dx, p_dy)
+                conf = float(pred_state["confidence"])
+                turn_speed = min(self.max_aim_delta * 0.85, max(30.0, dist * 0.40)) * conf
+                dx = float(np.clip(turn_speed * math.cos(ang), -self.max_aim_delta, self.max_aim_delta))
+                dy = float(np.clip(turn_speed * math.sin(ang) * 0.70, -self.max_aim_delta * 0.75, self.max_aim_delta * 0.75))
+            else:
+                # Fallback to discrete omnidirectional search sweeps
+                dx, dy = self.AIM_DELTAS[aim_act]
+
             self.prev_dx = 0.0
             self.prev_dy = 0.0
 
@@ -540,6 +563,7 @@ class RLPvpAgent:
                             "hit_type": "none",
                             "sprint_reset_ready": self.reward_engine.sprint_reset_ready,
                             "cooldown_charge": self.reward_engine.get_attack_cooldown_charge(),
+                            "prediction": self.reward_engine.predictor.get_current_state(),
                         }
                         if self._was_active:
                             self.input_ctrl.release_all(force=True)
@@ -547,6 +571,7 @@ class RLPvpAgent:
 
                     # 8. Update Desktop Keystrokes & Mousepad Overlay
                     if self.overlay:
+                        pred_info = reward_data.get("prediction", {})
                         target_dist = round(550.0 / max(30.0, float(det.get("box_h", 0))), 1) if det["has_target"] else 0.0
                         self.overlay.update(
                             active=active,
@@ -563,6 +588,8 @@ class RLPvpAgent:
                             target_dist=target_dist,
                             cooldown=reward_data.get("cooldown_charge", 1.0),
                             hit_type=reward_data.get("hit_type", "none"),
+                            predicting=pred_info.get("is_predicting", False),
+                            pred_direction=pred_info.get("direction", "CENTER"),
                         )
 
                     # 9. Render Legacy OpenCV HUD (Optional with --cv-hud)
