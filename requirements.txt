@@ -7,3 +7,5 @@ numpy
 pillow
 opencv-python
 matplotlib
+mss
+pywin32

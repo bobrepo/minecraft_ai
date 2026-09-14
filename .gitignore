@@ -24,6 +24,7 @@ checkpoints/
 models/*.pth
 models/*.pt
 *.onnx
+out_vid/
 
 # Logs & monitoring
 runs/
