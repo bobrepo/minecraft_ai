@@ -5,7 +5,7 @@ cd /d "%~dp0"
 echo ========================================================
 echo   Minecraft AI: Real-Time Window Capture and Recorder
 echo   Tick Rate:  20 ticks/sec (50ms interval)
-echo   Resolution: 854x480 (standard 480p 16:9)
+echo   Resolution: 640x480 (standard VGA 4:3)
 echo ========================================================
 echo.
 

@@ -71,7 +71,7 @@ def select_window_interactively() -> int:
 def record_window(
     target: Optional[str | int] = None,
     fps: float = 20.0,
-    target_width: int = 854,
+    target_width: int = 640,
     target_height: int = 480,
     output_dir: str = "out_vid",
     preview: bool = True,
@@ -82,8 +82,8 @@ def record_window(
     Args:
         target: Window title, substring, or HWND. If None, prompts interactively.
         fps: Target capture tick rate (default 20.0 for Minecraft ticks).
-        target_width: Output width (default 854 for 480p 16:9).
-        target_height: Output height (default 480 for 480p 16:9).
+        target_width: Output width (default 640 for 480p 4:3).
+        target_height: Output height (default 480 for 480p 4:3).
         output_dir: Output folder for saved videos.
         preview: Whether to display a live OpenCV preview window.
         max_frames: Optional frame limit (useful for automated testing).
@@ -217,7 +217,7 @@ def record_window(
                 current_fps = stats["written"] / elapsed if elapsed > 0 else 0
                 cv2.putText(
                     preview_frame,
-                    f"REC [854x480] | {stats['written']} ticks | {current_fps:.1f} TPS | Press 'q' to stop",
+                    f"REC [{target_width}x{target_height}] | {stats['written']} ticks | {current_fps:.1f} TPS | Press 'q' to stop",
                     (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -253,10 +253,10 @@ def record_window(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Real-time window capture at Minecraft tick speed (20 TPS) in 854x480 resolution.")
+    parser = argparse.ArgumentParser(description="Real-time window capture at Minecraft tick speed (20 TPS) in 640x480 resolution.")
     parser.add_argument("-w", "--window", type=str, default=None, help="Target window title or substring (e.g. 'Minecraft')")
     parser.add_argument("--fps", type=float, default=20.0, help="Target tick rate / FPS (default: 20.0)")
-    parser.add_argument("--width", type=int, default=854, help="Output video width (default: 854)")
+    parser.add_argument("--width", type=int, default=640, help="Output video width (default: 640)")
     parser.add_argument("--height", type=int, default=480, help="Output video height (default: 480)")
     parser.add_argument("-o", "--output", type=str, default="out_vid", help="Output directory (default: out_vid)")
     parser.add_argument("--no-preview", action="store_true", help="Disable the live preview window")
