@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 import torch
 
-from input_controller import InputController
+from input_controller import EmergencyKillswitchListener, InputController
 from model import MinecraftPvPCNN
 from vision_detector import VisionDetector
 from window_capture import WindowCapture, is_minecraft_window, list_windows
@@ -28,11 +28,6 @@ from window_capture import WindowCapture, is_minecraft_window, list_windows
 # Virtual Key Codes
 VK_F6 = 0x75
 VK_ESCAPE = 0x1B
-
-
-def is_key_pressed(vk_code: int) -> bool:
-    """Check if a physical key is currently pressed globally via Windows API."""
-    return bool(ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000)
 
 
 def select_window_interactively() -> int:
@@ -95,7 +90,7 @@ class PvpAgent:
         aim_kp: float = 0.55,
         aim_kd: float = 0.12,
         max_aim_delta: float = 150.0,
-        attack_cooldown: float = 0.35,
+        attack_cooldown: float = 0.625,  # Minecraft 1.9+ sword attack speed (0.625s)
         spam_click: bool = False,
         record_combat: bool = True,
         model_path: Optional[str] = None,
@@ -107,8 +102,9 @@ class PvpAgent:
         self.attack_cooldown = 0.05 if spam_click else attack_cooldown
         self.record_combat = record_combat
 
-        # Controllers
+        # Controllers & Failsafe Listener
         self.input_ctrl = InputController()
+        self.killswitch = EmergencyKillswitchListener(self.input_ctrl)
         self.detector = VisionDetector(resolution)
 
         # PyTorch Neural Network
@@ -131,7 +127,7 @@ class PvpAgent:
         print(f"[+] Hooked to window: '{self.cap.window_title}' (HWND: {self.cap.hwnd})", flush=True)
 
         # State tracking for PD controller
-        self.is_active: bool = False
+        # State tracking for PD controller & W-Tap
         self.prev_dx: float = 0.0
         self.prev_dy: float = 0.0
         self.last_attack_time: float = 0.0
@@ -139,6 +135,10 @@ class PvpAgent:
         self.ticks_without_target: int = 0
         self.strafe_tick: int = 0
         self.strafe_direction: str = "d"
+
+        # W-Tap state machine (resets sprint after attacks to chain KB hits)
+        self.w_tap_ticks: int = 0
+        self.is_w_tapping: bool = False
 
         # Combat session video recorder
         self.video_writer: Optional[cv2.VideoWriter] = None
@@ -149,6 +149,14 @@ class PvpAgent:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             self.video_writer = cv2.VideoWriter(self.rec_path, fourcc, 20.0, (self.width, self.height))
             print(f"[+] Recording combat session to: {self.rec_path}", flush=True)
+
+    @property
+    def is_active(self) -> bool:
+        return self.killswitch.is_active
+
+    @is_active.setter
+    def is_active(self, val: bool):
+        self.killswitch.set_active(val)
 
     def step(self, frame_bgr: np.ndarray) -> dict:
         """Execute one 20 TPS combat decision step."""
@@ -174,34 +182,41 @@ class PvpAgent:
             cur_dx = det["dx"]
             cur_dy = det["dy"]
 
-            # PD (Proportional-Derivative) Aiming Calculation
-            # P-term: drives crosshair toward target
-            # D-term: dampens acceleration to eliminate overshoot
+            # PD Aiming Calculation
             d_dx = cur_dx - self.prev_dx
             d_dy = cur_dy - self.prev_dy
 
             aim_x = (cur_dx * self.aim_kp) + (d_dx * self.aim_kd)
             aim_y = (cur_dy * self.aim_kp) + (d_dy * self.aim_kd)
 
-            # Deadband to prevent jitter when crosshairs match
             if abs(cur_dx) < 3.0:
                 aim_x = 0.0
             if abs(cur_dy) < 3.0:
                 aim_y = 0.0
 
-            # High-velocity snap clamp (up to max_aim_delta)
             actions["dx"] = float(np.clip(aim_x, -self.max_aim_delta, self.max_aim_delta))
             actions["dy"] = float(np.clip(aim_y, -self.max_aim_delta * 0.7, self.max_aim_delta * 0.7))
 
             self.prev_dx = cur_dx
             self.prev_dy = cur_dy
 
-            # Agile PvP Movement:
-            # Always sprint toward target when closing distance
-            actions["w"] = True
-            actions["sprint"] = True
+            # W-Tap Sprint Reset Logic:
+            # If in attack range and W-tap is active, release W for 2 ticks to reset sprint
+            if self.is_w_tapping:
+                self.w_tap_ticks += 1
+                if self.w_tap_ticks >= 2:
+                    self.is_w_tapping = False
+                    self.w_tap_ticks = 0
+                    actions["w"] = True
+                    actions["sprint"] = True
+                else:
+                    actions["w"] = False
+                    actions["sprint"] = False
+            else:
+                actions["w"] = True
+                actions["sprint"] = True
 
-            # Circle-Strafing when in close combat
+            # Circle-Strafing in melee combat
             if det["in_attack_range"]:
                 self.strafe_tick += 1
                 if self.strafe_tick % 10 == 0:
@@ -212,16 +227,20 @@ class PvpAgent:
                 else:
                     actions["d"] = True
 
-            # Attack Strike Execution
+            # Attack Punch Execution (timed cooldown to avoid spam penalty)
             now = time.perf_counter()
             if det["in_attack_range"] and (now - self.last_attack_time >= self.attack_cooldown):
                 actions["attack"] = True
                 self.last_attack_time = now
+                # Trigger W-tap reset after attack strike
+                self.is_w_tapping = True
+                self.w_tap_ticks = 0
 
         else:
             self.ticks_without_target += 1
             self.prev_dx = 0.0
             self.prev_dy = 0.0
+            self.is_w_tapping = False
 
             # Fast search rotation: turn around quickly if enemy moved out of view
             if self.ticks_without_target > 4:
@@ -231,11 +250,9 @@ class PvpAgent:
 
         # 3. Hardware DirectInput Dispatch
         if self.is_active:
-            # Snap 3D camera mouse aim
             if actions["dx"] != 0 or actions["dy"] != 0:
                 self.input_ctrl.move_mouse(int(actions["dx"]), int(actions["dy"]))
 
-            # Dispatch movement, sprint, and strafing
             self.input_ctrl.set_movement(
                 w=actions["w"],
                 s=actions["s"],
@@ -245,7 +262,6 @@ class PvpAgent:
                 jump=actions["jump"],
             )
 
-            # Instantaneous attack punch
             if actions["attack"]:
                 self.input_ctrl.attack_click()
         else:
@@ -260,34 +276,26 @@ class PvpAgent:
         print(" MINECRAFT HIGH-SPEED PVP COMBAT AI", flush=True)
         print("=" * 60, flush=True)
         print(f"  Aim Speed:        P-Gain: {self.aim_kp} | Max Delta: {self.max_aim_delta} px/tick", flush=True)
-        print(f"  Attack Cooldown:  {self.attack_cooldown:.2f}s", flush=True)
+        print(f"  Attack Cooldown:  {self.attack_cooldown:.2f}s (Minecraft 1.9+ anti-spam timed)", flush=True)
         print(f"  Combat Recording: {'ENABLED (' + self.rec_path + ')' if self.video_writer else 'DISABLED'}", flush=True)
         print("=" * 60, flush=True)
         print("  Controls:", flush=True)
-        print("    [F6]    : TOGGLE AI ON / OFF (Emergency Killswitch)", flush=True)
+        print("    [F6]    : TOGGLE AI ON / OFF (Audio Beep Confirmation)", flush=True)
+        print("    [ESC]   : INSTANT EMERGENCY STOP (Pauses and releases all keys)", flush=True)
         print("    [q]     : Quit Agent (in HUD window)", flush=True)
         print("    [Ctrl+C]: Stop Agent in terminal", flush=True)
         print("=" * 60, flush=True)
         print("[!] Press F6 in Minecraft to ACTIVATE high-speed combat!\n", flush=True)
 
-        f6_was_pressed = False
         next_tick = time.perf_counter()
 
         try:
             while True:
-                # Check F6 toggle key
-                f6_current = is_key_pressed(VK_F6)
-                if f6_current and not f6_was_pressed:
-                    self.is_active = not self.is_active
-                    status = ">>> ACTIVE (ATTACKING & SPRINTING) <<<" if self.is_active else "PAUSED"
-                    print(f"\n[AI STATUS: {status}]\n", flush=True)
-                    if not self.is_active:
-                        self.input_ctrl.release_all()
-                f6_was_pressed = f6_current
-
                 if not self.cap.is_valid():
                     print("[!] Target window closed. Stopping agent.", flush=True)
                     break
+
+                active = self.is_active
 
                 success, frame = self.cap.get_frame()
                 if success and frame is not None:
@@ -298,9 +306,23 @@ class PvpAgent:
                         actions = step_result["actions"]
                         hud = self.detector.draw_hud(frame, det, actions)
 
-                        state_color = (0, 255, 0) if self.is_active else (0, 255, 255)
-                        state_txt = "AI: FIGHTING [F6 to Pause]" if self.is_active else "AI: PAUSED [Press F6 to Start]"
-                        cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
+                        state_color = (0, 255, 0) if active else (0, 255, 255)
+                        state_txt = "AI: FIGHTING [F6: Pause | ESC: STOP]" if active else "AI: PAUSED [Press F6 in MC to Start]"
+                        cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2)
+
+                        # Attack Cooldown Meter
+                        now = time.perf_counter()
+                        elapsed = now - self.last_attack_time
+                        ratio = min(1.0, elapsed / max(0.001, self.attack_cooldown))
+                        bars = int(ratio * 10)
+                        meter_str = f"Atk Cooldown: [{'|' * bars}{'.' * (10 - bars)}] {int(ratio * 100)}%"
+                        meter_color = (0, 255, 0) if ratio >= 0.85 else (0, 0, 255)
+                        cv2.putText(hud, meter_str, (10, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.48, meter_color, 1)
+
+                        # W-tap status badge
+                        wtap_txt = "W-TAP RESETTING" if self.is_w_tapping else "SPRINT LOCKED"
+                        wtap_col = (0, 255, 255) if self.is_w_tapping else (200, 200, 200)
+                        cv2.putText(hud, f"Status: {wtap_txt}", (10, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.48, wtap_col, 1)
 
                         cv2.imshow("Minecraft PvP AI - High-Speed Combat HUD (Press 'q' to stop)", hud)
                         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -316,6 +338,7 @@ class PvpAgent:
         except KeyboardInterrupt:
             print("\n[+] Stop signal (Ctrl+C) received.", flush=True)
         finally:
+            self.killswitch.stop()
             self.input_ctrl.release_all()
             if self.video_writer:
                 self.video_writer.release()

@@ -4,8 +4,10 @@ Uses Windows SendInput with direct hardware scan codes for 100% DirectX compatib
 """
 
 import ctypes
+import threading
 import time
-from typing import Dict, Set
+from typing import Callable, Dict, Optional, Set
+import winsound
 
 # Windows API constants
 PUL = ctypes.POINTER(ctypes.c_ulong)
@@ -189,9 +191,98 @@ class InputController:
         self.left_up()
 
     def release_all(self):
-        """Safety failsafe: release all currently pressed keys and mouse buttons."""
-        for key in list(self._pressed_keys):
-            self.release_key(key)
+        """Safety failsafe: release all known keys and mouse buttons unconditionally."""
+        extra = ctypes.c_ulong(0)
+        # Flush all registered scan codes to prevent stuck keys in DirectX
+        for code in SCAN_CODES.values():
+            ii_ = Input_I()
+            ii_.ki = KeyBdInput(0, code, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0, ctypes.pointer(extra))
+            x = Input(ctypes.c_ulong(INPUT_KEYBOARD), ii_)
+            ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
         self._pressed_keys.clear()
-        if self._mouse_down:
-            self.left_up()
+
+        # Flush both left and right mouse buttons
+        ii_m = Input_I()
+        ii_m.mi = MouseInput(0, 0, 0, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP, 0, ctypes.pointer(extra))
+        x_m = Input(ctypes.c_ulong(INPUT_MOUSE), ii_m)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x_m), ctypes.sizeof(x_m))
+        self._mouse_down = False
+
+
+class EmergencyKillswitchListener:
+    """High-frequency background daemon thread monitoring emergency stop hotkeys.
+
+    Guarantees that the AI can ALWAYS be stopped instantly with 100% reliability,
+    even when Minecraft has raw 3D mouse capture or the main thread is processing.
+
+    Hotkeys:
+    - [F6]  : Toggle AI Active / Paused state.
+    - [ESC] : Instant Emergency Stop (pauses immediately and releases all inputs).
+    """
+
+    def __init__(self, input_ctrl: InputController, on_state_change: Optional[Callable[[bool], None]] = None):
+        self.input_ctrl = input_ctrl
+        self.on_state_change = on_state_change
+        self.is_active: bool = False
+        self._running: bool = True
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+
+    def set_active(self, active: bool):
+        """Programmatically update active state."""
+        self.is_active = active
+        if not active:
+            self.input_ctrl.release_all()
+
+    def _monitor_loop(self):
+        VK_F6 = 0x75
+        VK_ESCAPE = 0x1B
+        f6_prev = False
+        esc_prev = False
+
+        while self._running:
+            try:
+                f6_down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F6) & 0x8000)
+                esc_down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
+
+                # ESC: Instant Emergency Kill / Pause
+                if esc_down and not esc_prev:
+                    if self.is_active:
+                        self.is_active = False
+                        self.input_ctrl.release_all()
+                        try:
+                            winsound.Beep(550, 160)
+                        except Exception:
+                            pass
+                        print("\n[EMERGENCY STOP TRIGGERED (ESC): AI PAUSED & ALL INPUTS RELEASED]", flush=True)
+                        if self.on_state_change:
+                            self.on_state_change(False)
+
+                # F6: Toggle Active / Paused
+                elif f6_down and not f6_prev:
+                    self.is_active = not self.is_active
+                    self.input_ctrl.release_all()
+                    try:
+                        if self.is_active:
+                            winsound.Beep(1200, 100)
+                        else:
+                            winsound.Beep(600, 140)
+                    except Exception:
+                        pass
+                    status = ">>> ACTIVE (FIGHTING) <<<" if self.is_active else "PAUSED"
+                    print(f"\n[AI STATE TOGGLE (F6): {status}]", flush=True)
+                    if self.on_state_change:
+                        self.on_state_change(self.is_active)
+
+                f6_prev = f6_down
+                esc_prev = esc_down
+            except Exception:
+                pass
+            time.sleep(0.005)  # 5ms continuous polling
+
+    def stop(self):
+        """Stop listener and ensure all inputs are released."""
+        self._running = False
+        self.is_active = False
+        self.input_ctrl.release_all()
+

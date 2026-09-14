@@ -19,10 +19,13 @@ except Exception:
 import mss
 import win32con
 import win32gui
+import win32process
 import win32ui
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
+PW_CLIENTONLY = 1
+PW_RENDERFULLCONTENT = 2
 
 # Attach thread to interactive desktop if running in a separate service/runner desktop
 try:
@@ -192,15 +195,34 @@ class WindowCapture:
         query_lower = query.lower()
         active_windows = list_windows(include_minimized=True)
 
+        # 1. First priority: actual Minecraft clients
+        for hwnd, title in active_windows:
+            clean = title.replace(" [Minimized]", "").strip().lower()
+            if is_minecraft_window(hwnd, title):
+                if query_lower in ["minecraft", "mc", "game", "client"] or query_lower in clean:
+                    return hwnd
+
+        # 2. Exact match on clean title
         for hwnd, title in active_windows:
             clean = title.replace(" [Minimized]", "").strip().lower()
             if clean == query_lower:
                 return hwnd
 
+        # 3. Substring match (strictly excluding browsers, editors, file explorers, and terminals)
         for hwnd, title in active_windows:
             clean = title.replace(" [Minimized]", "").strip().lower()
             if query_lower in clean:
+                pname = get_window_process_name(hwnd).lower()
+                if any(k in pname for k in ["chrome", "msedge", "firefox", "brave", "opera", "explorer", "cmd", "powershell", "antigravity", "code", "terminal"]):
+                    continue
                 return hwnd
+
+        # 4. General fallback only if query is NOT looking for Minecraft specifically
+        if query_lower not in ["minecraft", "mc", "game", "client"]:
+            for hwnd, title in active_windows:
+                clean = title.replace(" [Minimized]", "").strip().lower()
+                if query_lower in clean:
+                    return hwnd
 
         return None
 
@@ -211,7 +233,7 @@ class WindowCapture:
         return True
 
     def _capture_printwindow(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Capture directly from the window's DC using PrintWindow (captures window even if covered)."""
+        """Capture directly from the window's client DC using PrintWindow (captures window even if covered)."""
         if not self.is_valid():
             return False, None
 
@@ -222,7 +244,8 @@ class WindowCapture:
             if w <= 10 or h <= 10:
                 return False, None
 
-            hwnd_dc = win32gui.GetWindowDC(self.hwnd)
+            # Use GetDC (client area DC) instead of GetWindowDC (which includes title bar & borders)
+            hwnd_dc = win32gui.GetDC(self.hwnd)
             mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
             save_dc = mfc_dc.CreateCompatibleDC()
 
@@ -230,10 +253,10 @@ class WindowCapture:
             save_bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
             save_dc.SelectObject(save_bitmap)
 
-            # PW_RENDERFULLCONTENT = 2
-            result = user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 2)
+            # PW_CLIENTONLY = 1 ensures only client area is drawn, keeping crosshair dead-center
+            result = user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), PW_CLIENTONLY)
             if not result:
-                result = user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 1)
+                result = user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 0)
 
             if result:
                 bmpinfo = save_bitmap.GetInfo()
@@ -261,14 +284,17 @@ class WindowCapture:
             return False, None
 
         try:
-            _, _, w, h = win32gui.GetClientRect(self.hwnd)
+            if win32gui.IsIconic(self.hwnd):
+                win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            w = right - left
+            h = bottom - top
             if w <= 10 or h <= 10:
-                rect = win32gui.GetWindowRect(self.hwnd)
-                w = rect[2] - rect[0]
-                h = rect[3] - rect[1]
-                screen_x, screen_y = rect[0], rect[1]
-            else:
-                screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
+                return False, None
+
+            # ClientToScreen maps (0,0) of client area to screen coordinates, perfectly bypassing title bars
+            screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
 
             # Clamp coordinates to primary screen bounds to prevent BitBlt errors
             mon = self.sct.monitors[1] if len(self.sct.monitors) > 1 else self.sct.monitors[0]

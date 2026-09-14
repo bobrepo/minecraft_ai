@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from input_controller import InputController
+from input_controller import EmergencyKillswitchListener, InputController
 from reward_system import PvPRewardEngine
 from vision_detector import VisionDetector
 from window_capture import WindowCapture, is_minecraft_window, list_windows
@@ -198,13 +198,21 @@ class RLPvpAgent:
         self.cap = WindowCapture(target_hwnd)
         print(f"[+] Hooked to Minecraft: '{self.cap.window_title}' (HWND: {self.cap.hwnd})", flush=True)
 
-        # Agent state
-        self.is_active = False
+        # Agent state & Emergency Killswitch Listener
+        self.killswitch = EmergencyKillswitchListener(self.input_ctrl)
         self.prev_state_tensor: Optional[np.ndarray] = None
         self.prev_action_tuple: Optional[Tuple[int, int, int, int]] = None
         self.cumulative_reward = 0.0
         self.step_count = 0
         self.last_loss = 0.0
+
+    @property
+    def is_active(self) -> bool:
+        return self.killswitch.is_active
+
+    @is_active.setter
+    def is_active(self, val: bool):
+        self.killswitch.set_active(val)
 
     def preprocess_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Convert BGR frame to compact (3, 240, 320) float32 representation for RL buffer."""
@@ -216,14 +224,27 @@ class RLPvpAgent:
         """Epsilon-greedy multi-branch action selection with vision-guided heuristics."""
         # Exploration
         if random.random() < self.epsilon:
-            # 50% chance to follow vision heuristic for fast bootstrapping
-            if det["has_target"] and random.random() < 0.6:
-                # Vision-guided action
+            if det["has_target"] and random.random() < 0.65:
+                # 1. Vision-guided aiming heuristic
                 dx = det["dx"]
                 aim_act = 1 if dx < -50 else (2 if dx < -10 else (3 if dx > 10 else (4 if dx > 50 else 0)))
-                move_act = 2 if det["has_target"] else 1  # Sprint or walk
-                jump_act = 1 if (det["in_attack_range"] and random.random() < 0.35) else 0  # Jump for crits
-                atk_act = 1 if det["in_attack_range"] else 0
+
+                # 2. Movement heuristic with W-Tap sprint reset:
+                # If target is in range and we already landed sprint hit, release W to reset sprint!
+                if det["in_attack_range"] and self.reward_engine.consecutive_sprint_hits >= 1 and random.random() < 0.45:
+                    move_act = 0  # Release W briefly -> resets sprint counter for another +40 KB hit!
+                elif self.reward_engine.sprint_reset_ready:
+                    move_act = 2  # Sprint W to deliver high-knockback hit!
+                else:
+                    move_act = 2 if random.random() < 0.70 else 3  # Sprint or circle-strafe
+
+                # 3. Jump heuristic for Critical Hits
+                jump_act = 1 if (det["in_attack_range"] and random.random() < 0.35) else 0
+
+                # 4. Anti-spam attack heuristic: Only attack when weapon cooldown is >= 85%!
+                charge = self.reward_engine.get_attack_cooldown_charge()
+                atk_act = 1 if (det["in_attack_range"] and charge >= 0.85) else 0
+
                 return aim_act, move_act, jump_act, atk_act
             else:
                 return (
@@ -329,30 +350,22 @@ class RLPvpAgent:
         print(" MINECRAFT REINFORCEMENT LEARNING (RL) AGENT", flush=True)
         print("=" * 60, flush=True)
         print("  Controls:", flush=True)
-        print("    [F6]   : TOGGLE RL BOT ON / OFF (Emergency Killswitch)", flush=True)
+        print("    [F6]   : TOGGLE RL BOT ON / OFF (Audio Beep Feedback)", flush=True)
+        print("    [ESC]  : INSTANT EMERGENCY STOP (Pauses and releases all keys)", flush=True)
         print("    [q]    : Quit & Save Trained Weights (in HUD window)", flush=True)
         print("    Ctrl+C : Stop Agent in terminal", flush=True)
         print("=" * 60, flush=True)
         print("[!] Press F6 in Minecraft to START Reinforcement Learning!\n", flush=True)
 
-        f6_was_pressed = False
         next_tick = time.perf_counter()
 
         try:
             while True:
-                # Check F6 toggle key
-                f6_current = is_key_pressed(VK_F6)
-                if f6_current and not f6_was_pressed:
-                    self.is_active = not self.is_active
-                    status = ">>> ACTIVE (SPARRING & LEARNING) <<<" if self.is_active else "PAUSED"
-                    print(f"\n[RL STATUS: {status}]\n", flush=True)
-                    if not self.is_active:
-                        self.input_ctrl.release_all()
-                f6_was_pressed = f6_current
-
                 if not self.cap.is_valid():
                     print("[!] Minecraft window closed. Stopping agent.", flush=True)
                     break
+
+                active = self.is_active
 
                 # 1. Capture screen
                 success, frame = self.cap.get_frame()
@@ -365,12 +378,18 @@ class RLPvpAgent:
                     action_tuple = self.select_action(state_arr, det)
 
                     # 4. Dispatch action if active
-                    if self.is_active:
+                    if active:
                         action_dict = self.dispatch_action(action_tuple)
-                        self.reward_engine.record_action(jump=action_dict["jump"], attack=action_dict["attack"])
+                        action_flags = self.reward_engine.record_action(
+                            w=action_dict["w"],
+                            jump=action_dict["jump"],
+                            attack=action_dict["attack"],
+                        )
 
-                        # 5. Compute Visual Reward
-                        reward_data = self.reward_engine.compute_reward(frame, det, action_dict)
+                        # 5. Compute Visual Reward with PvP Mechanics Breakdown
+                        reward_data = self.reward_engine.compute_reward(
+                            frame, det, action_dict, action_flags=action_flags
+                        )
                         reward = reward_data["reward"]
                         self.cumulative_reward += reward
 
@@ -390,22 +409,45 @@ class RLPvpAgent:
                         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
                     else:
                         action_dict = {}
-                        reward_data = {"reward": 0.0, "hit_type": "none"}
+                        self.reward_engine.record_action(w=False, jump=False, attack=False)
+                        reward_data = {
+                            "reward": 0.0,
+                            "hit_type": "none",
+                            "sprint_reset_ready": self.reward_engine.sprint_reset_ready,
+                            "cooldown_charge": self.reward_engine.get_attack_cooldown_charge(),
+                        }
                         self.input_ctrl.release_all()
 
-                    # 8. Render HUD
+                    # 8. Render Rich Combat HUD
                     hud = self.detector.draw_hud(frame, det, action_dict)
-                    state_color = (0, 255, 0) if self.is_active else (0, 255, 255)
-                    state_txt = "RL: SPARRING & LEARNING [F6: Pause]" if self.is_active else "RL: PAUSED [Press F6 to Start]"
-                    cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
+                    state_color = (0, 255, 0) if active else (0, 255, 255)
+                    state_txt = "RL: FIGHTING & LEARNING [F6: Pause | ESC: STOP]" if active else "RL: PAUSED [Press F6 in MC to Start]"
+                    cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2)
 
-                    # RL Metrics HUD
-                    rl_metric_txt = f"Reward: {reward_data['reward']:+.1f} (Total: {self.cumulative_reward:.0f}) | Eps: {self.epsilon:.2f} | Loss: {self.last_loss:.3f}"
-                    cv2.putText(hud, rl_metric_txt, (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    # Cooldown Charge Meter
+                    charge = reward_data.get("cooldown_charge", 1.0)
+                    bars = int(charge * 10)
+                    meter_str = f"Atk Meter: [{'|' * bars}{'.' * (10 - bars)}] {int(charge * 100)}%"
+                    meter_color = (0, 255, 0) if charge >= 0.85 else (0, 0, 255)
+                    cv2.putText(hud, meter_str, (10, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.48, meter_color, 1)
+
+                    # RL Metrics & Knockback Readiness
+                    kb_ready = reward_data.get("sprint_reset_ready", True)
+                    kb_txt = "KB READY (+40)" if kb_ready else "SWEEP MODE (+10)"
+                    kb_color = (0, 255, 255) if kb_ready else (180, 180, 180)
+                    rl_metric_txt = f"Reward: {reward_data['reward']:+.1f} (Tot: {self.cumulative_reward:.0f}) | {kb_txt} | Loss: {self.last_loss:.3f}"
+                    cv2.putText(hud, rl_metric_txt, (10, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.48, kb_color, 1)
 
                     if reward_data.get("hit_type") != "none":
-                        hit_color = (0, 255, 255) if "hit" in reward_data["hit_type"] else (0, 0, 255)
-                        cv2.putText(hud, f"EVENT: {reward_data['hit_type'].upper()}!", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hit_color, 2)
+                        ht = reward_data["hit_type"]
+                        hit_color = (
+                            (0, 255, 0) if "knockback" in ht
+                            else ((0, 255, 255) if "critical" in ht
+                            else ((0, 0, 255) if "spam" in ht
+                            else ((200, 200, 0) if "sweep" in ht
+                            else (200, 200, 200))))
+                        )
+                        cv2.putText(hud, f"EVENT: {ht.upper()}!", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.65, hit_color, 2)
 
                     cv2.imshow("Minecraft PvP RL Agent - Live Training HUD (Press 'q' to stop)", hud)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -421,6 +463,7 @@ class RLPvpAgent:
         except KeyboardInterrupt:
             print("\n[+] Stop signal received.", flush=True)
         finally:
+            self.killswitch.stop()
             self.input_ctrl.release_all()
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
             torch.save(self.q_net.state_dict(), self.save_path)
