@@ -22,7 +22,12 @@ import winsound
 
 import cv2
 import numpy as np
-from pynput import mouse
+try:
+    from pynput import mouse
+    HAS_PYNPUT = True
+except ImportError:
+    mouse = None
+    HAS_PYNPUT = False
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -138,9 +143,12 @@ class TrainingDataRecorder:
         self._last_pynput_pos: Optional[Tuple[int, int]] = None
         self._last_cursor_pos: Optional[Tuple[int, int]] = None
 
-        self._mouse_listener = mouse.Listener(on_move=self._on_mouse_move)
-        self._mouse_listener.daemon = True
-        self._mouse_listener.start()
+        if HAS_PYNPUT and mouse is not None:
+            self._mouse_listener = mouse.Listener(on_move=self._on_mouse_move)
+            self._mouse_listener.daemon = True
+            self._mouse_listener.start()
+        else:
+            self._mouse_listener = None
 
         self.is_recording = False
         self.stop_requested = False
