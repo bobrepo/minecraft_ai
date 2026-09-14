@@ -71,15 +71,19 @@ def select_window_interactively() -> int:
 def record_window(
     target: Optional[str | int] = None,
     fps: float = 20.0,
+    target_width: int = 854,
+    target_height: int = 480,
     output_dir: str = "out_vid",
     preview: bool = True,
     max_frames: Optional[int] = None,
 ):
-    """Record the chosen window at the specified tick rate.
+    """Record the chosen window at the specified tick rate and resolution.
 
     Args:
         target: Window title, substring, or HWND. If None, prompts interactively.
         fps: Target capture tick rate (default 20.0 for Minecraft ticks).
+        target_width: Output width (default 854 for 480p 16:9).
+        target_height: Output height (default 480 for 480p 16:9).
         output_dir: Output folder for saved videos.
         preview: Whether to display a live OpenCV preview window.
         max_frames: Optional frame limit (useful for automated testing).
@@ -112,13 +116,13 @@ def record_window(
         cap.close()
         return
 
-    height, width = initial_frame.shape[:2]
+    orig_h, orig_w = initial_frame.shape[:2]
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_filename = os.path.join(output_dir, f"capture_{timestamp_str}.mp4")
 
-    # OpenCV VideoWriter with MP4V codec
+    # OpenCV VideoWriter with MP4V codec locked to target resolution (854x480)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_filename, fourcc, fps, (width, height))
+    writer = cv2.VideoWriter(out_filename, fourcc, fps, (target_width, target_height))
 
     if not writer.isOpened():
         print(f"[!] Error: Could not open video writer for {out_filename}", flush=True)
@@ -128,7 +132,7 @@ def record_window(
     tick_interval = 1.0 / fps
     print(f"[+] Output file: {os.path.abspath(out_filename)}", flush=True)
     print(f"[+] Capture rate: {fps:.1f} ticks/second (50ms tick interval)", flush=True)
-    print(f"[+] Resolution: {width}x{height}", flush=True)
+    print(f"[+] Resolution: {target_width}x{target_height} (source window: {orig_w}x{orig_h})", flush=True)
     print("[+] Recording started! Press 'q' in preview or Ctrl+C in terminal to stop.\n", flush=True)
 
     frame_queue = queue.Queue(maxsize=120)
@@ -192,9 +196,9 @@ def record_window(
             except queue.Empty:
                 continue
 
-            # Ensure frame size matches video container
-            if frame.shape[:2] != (height, width):
-                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            # Ensure frame size matches target video container (854x480)
+            if frame.shape[1] != target_width or frame.shape[0] != target_height:
+                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
             writer.write(frame)
             stats["written"] += 1
@@ -208,16 +212,12 @@ def record_window(
                 last_status_print = now
 
             if preview:
-                preview_frame = frame
-                if width > 960:
-                    scale = 960 / width
-                    preview_frame = cv2.resize(frame, (960, int(height * scale)))
-
+                preview_frame = frame.copy()
                 elapsed = now - start_time
                 current_fps = stats["written"] / elapsed if elapsed > 0 else 0
                 cv2.putText(
                     preview_frame,
-                    f"REC | {stats['written']} ticks | {current_fps:.1f} TPS | Press 'q' to stop",
+                    f"REC [854x480] | {stats['written']} ticks | {current_fps:.1f} TPS | Press 'q' to stop",
                     (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -253,9 +253,11 @@ def record_window(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Real-time window capture at Minecraft tick speed (20 TPS).")
+    parser = argparse.ArgumentParser(description="Real-time window capture at Minecraft tick speed (20 TPS) in 854x480 resolution.")
     parser.add_argument("-w", "--window", type=str, default=None, help="Target window title or substring (e.g. 'Minecraft')")
     parser.add_argument("--fps", type=float, default=20.0, help="Target tick rate / FPS (default: 20.0)")
+    parser.add_argument("--width", type=int, default=854, help="Output video width (default: 854)")
+    parser.add_argument("--height", type=int, default=480, help="Output video height (default: 480)")
     parser.add_argument("-o", "--output", type=str, default="out_vid", help="Output directory (default: out_vid)")
     parser.add_argument("--no-preview", action="store_true", help="Disable the live preview window")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of frames (useful for test runs)")
@@ -264,6 +266,8 @@ def main():
     record_window(
         target=args.window,
         fps=args.fps,
+        target_width=args.width,
+        target_height=args.height,
         output_dir=args.output,
         preview=not args.no_preview,
         max_frames=args.max_frames,
