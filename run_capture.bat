@@ -1,5 +1,5 @@
 @echo off
-title Minecraft AI - Window Capture and Recorder (20 TPS)
+title Agent Runner - Window Capture
 cd /d "%~dp0"
 
 echo ========================================================

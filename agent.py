@@ -23,7 +23,7 @@ import torch
 from input_controller import InputController
 from model import MinecraftPvPCNN
 from vision_detector import VisionDetector
-from window_capture import WindowCapture, list_windows
+from window_capture import WindowCapture, is_minecraft_window, list_windows
 
 # Virtual Key Codes
 VK_F6 = 0x75
@@ -42,9 +42,9 @@ def select_window_interactively() -> int:
         print("[!] No visible application windows detected.", flush=True)
         sys.exit(1)
 
-    # Check if Minecraft is already open
+    # Check if real Minecraft is already open
     for hwnd, title in windows:
-        if "minecraft" in title.lower():
+        if is_minecraft_window(hwnd, title):
             print(f"[+] Auto-detected Minecraft window: '{title}' (HWND: {hwnd})", flush=True)
             return hwnd
 

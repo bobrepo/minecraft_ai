@@ -1,5 +1,5 @@
 @echo off
-title Minecraft AI - PvP Combat Agent (20 TPS)
+title Agent Runner - PvP Combat Agent
 cd /d "%~dp0"
 
 echo ========================================================

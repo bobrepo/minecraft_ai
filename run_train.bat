@@ -1,5 +1,5 @@
 @echo off
-title Minecraft AI - GPU Model Trainer
+title Agent Runner - GPU Model Trainer
 cd /d "%~dp0"
 
 echo ========================================================

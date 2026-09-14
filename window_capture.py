@@ -61,6 +61,39 @@ def _is_cloaked(hwnd: int) -> bool:
         return False
 
 
+def get_window_process_name(hwnd: int) -> str:
+    """Get the executable process name for a given window handle."""
+    try:
+        import os
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        h_proc = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not h_proc:
+            return ""
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(1024)
+        ctypes.windll.kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size))
+        ctypes.windll.kernel32.CloseHandle(h_proc)
+        return os.path.basename(buf.value)
+    except Exception:
+        return ""
+
+
+def is_minecraft_window(hwnd: int, title: str) -> bool:
+    """Strictly verify whether a window belongs to an actual Minecraft game client."""
+    pname = get_window_process_name(hwnd).lower()
+    if any(k in pname for k in ["minecraft", "javaw", "java", "lunar", "badlion", "feather"]):
+        return True
+
+    title_l = title.lower()
+    # Must start with Minecraft or Client, and must not be a web browser or file explorer
+    if (title_l.startswith("minecraft") or "lunar client" in title_l or "badlion client" in title_l) and not any(
+        b in title_l for b in ["chrome", "edge", "firefox", "explorer", "agent", "cmd", "powershell"]
+    ):
+        return True
+
+    return False
+
+
 def list_windows(include_minimized: bool = True) -> List[Tuple[int, str]]:
     """Enumerate visible application windows.
 
@@ -83,6 +116,20 @@ def list_windows(include_minimized: bool = True) -> List[Tuple[int, str]]:
 
             if title in IGNORE_TITLES or title.startswith("GDI+ Window"):
                 return True
+
+            # Filter out command prompt, PowerShell, or our own runner windows
+            title_lower = title.lower()
+            if any(term in title_lower for term in ["cmd.exe", "powershell", "agent runner", "model trainer", "window capture"]):
+                return True
+
+            # Filter out windows belonging to our current process
+            try:
+                import os
+                _, win_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if win_pid == os.getpid():
+                    return True
+            except Exception:
+                pass
 
             if _is_cloaked(hwnd):
                 return True
