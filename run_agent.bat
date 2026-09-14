@@ -24,9 +24,16 @@ if not exist ".venv\Scripts\activate.bat" (
 echo Activating virtual environment...
 call .venv\Scripts\activate.bat
 
-echo Launching PvP Combat Agent...
+echo Launching High-Speed PvP Combat Agent...
 echo.
-python agent.py
+
+if exist "models\pvp_model.pth" (
+    echo [INFO] Found trained model weights in models\pvp_model.pth! Loading weights...
+    python agent.py --model "models\pvp_model.pth"
+) else (
+    echo [INFO] Running in high-speed visual combat mode...
+    python agent.py
+)
 
 echo.
 echo ========================================================

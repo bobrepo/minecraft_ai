@@ -115,8 +115,8 @@ class InputController:
         ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
         self._pressed_keys.discard(key_lower)
 
-    def set_movement(self, w: bool = False, s: bool = False, a: bool = False, d: bool = False):
-        """Set directional movement keys in one call."""
+    def set_movement(self, w: bool = False, s: bool = False, a: bool = False, d: bool = False, sprint: bool = False, jump: bool = False):
+        """Set directional movement keys, sprinting, and jumping in one call."""
         # W / S forward/backward
         if w and not s:
             self.press_key("w")
@@ -139,6 +139,18 @@ class InputController:
             self.release_key("a")
             self.release_key("d")
 
+        # Sprinting (holding Ctrl)
+        if sprint and w:
+            self.press_key("ctrl")
+        else:
+            self.release_key("ctrl")
+
+        # Jumping (Space)
+        if jump:
+            self.press_key("space")
+        else:
+            self.release_key("space")
+
     def move_mouse(self, dx: int, dy: int):
         """Rotate first-person 3D camera by relative pixel deltas."""
         if dx == 0 and dy == 0:
@@ -151,6 +163,8 @@ class InputController:
 
     def left_down(self):
         """Press left mouse button (punch/attack start)."""
+        if self._mouse_down:
+            return
         extra = ctypes.c_ulong(0)
         ii_ = Input_I()
         ii_.mi = MouseInput(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, ctypes.pointer(extra))
@@ -160,6 +174,8 @@ class InputController:
 
     def left_up(self):
         """Release left mouse button."""
+        if not self._mouse_down:
+            return
         extra = ctypes.c_ulong(0)
         ii_ = Input_I()
         ii_.mi = MouseInput(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, ctypes.pointer(extra))
@@ -167,10 +183,9 @@ class InputController:
         ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
         self._mouse_down = False
 
-    def attack_click(self, hold_duration: float = 0.05):
-        """Perform a single attack punch click."""
+    def attack_click(self):
+        """Fast instantaneous attack punch without sleeping/blocking."""
         self.left_down()
-        time.sleep(hold_duration)
         self.left_up()
 
     def release_all(self):
