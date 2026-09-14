@@ -69,11 +69,18 @@ class PvPRewardEngine:
         flags = {
             "w_tap_reset": False,
             "spam_attack": False,
+            "jump_spam": False,
             "charge": self.get_attack_cooldown_charge(),
         }
 
-        # 1. Jump Physics Counter
+        # 1. Jump Physics Counter & Anti-Bunny-Hop Detection
         if jump:
+            if self.jump_tick_counter < 12:
+                # Bunny-hopping / spamming space while already airborne (<12 ticks)
+                flags["jump_spam"] = True
+            elif flags["charge"] < 0.85:
+                # Jumping while weapon cooldown is still recharging (<85%)
+                flags["jump_spam"] = True
             self.jump_tick_counter = 0
         else:
             self.jump_tick_counter += 1
@@ -179,12 +186,20 @@ class PvPRewardEngine:
         r_spam = 0.0
         r_dist_atk = 0.0
         r_hit = 0.0
+        r_jump_spam = 0.0
         hit_type = "none"
 
         # 1. Anti-Spam Click Penalty
         if action_flags.get("spam_attack"):
             r_spam = -8.0
             hit_type = "spam_penalty"
+
+        # Anti-Bunny-Hop Jump Spam Penalty:
+        # Penalizes jumping repeatedly in mid-air or jumping while weapon is still recharging (<85%)
+        if action_flags.get("jump_spam"):
+            r_jump_spam = -2.0
+            if hit_type == "none":
+                hit_type = "jump_spam_penalty"
 
         if det["has_target"]:
             # 2. Aim Centering Reward
@@ -262,7 +277,7 @@ class PvPRewardEngine:
                 if hit_type == "none":
                     hit_type = "whiff"
 
-        total_reward = float(r_aim + r_dist + r_dodge + r_wtap + r_spam + r_dist_atk + r_hit)
+        total_reward = float(r_aim + r_dist + r_dodge + r_wtap + r_spam + r_dist_atk + r_hit + r_jump_spam)
 
         return {
             "reward": total_reward,
@@ -273,6 +288,7 @@ class PvPRewardEngine:
             "r_spam": float(r_spam),
             "r_dist_atk": float(r_dist_atk),
             "r_hit": float(r_hit),
+            "r_jump_spam": float(r_jump_spam),
             "hit_type": hit_type,
             "is_falling": self.is_falling(),
             "sprint_reset_ready": self.sprint_reset_ready,

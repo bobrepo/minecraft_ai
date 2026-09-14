@@ -285,11 +285,14 @@ class RLPvpAgent:
                 else:
                     move_act = 2 if random.random() < 0.70 else 3  # Sprint or circle-strafe
 
-                # 3. Jump heuristic for Critical Hits
-                jump_act = 1 if (det["in_attack_range"] and random.random() < 0.35) else 0
+                # 3. Disciplined Jump Heuristic for Critical Hits:
+                # Anti-bunny-hop: ONLY jump when fully grounded (jump_tick_counter >= 12)
+                # and when weapon cooldown is charged (charge >= 0.85) to time the critical strike!
+                charge = self.reward_engine.get_attack_cooldown_charge()
+                is_grounded = self.reward_engine.jump_tick_counter >= 12
+                jump_act = 1 if (det["in_attack_range"] and charge >= 0.85 and is_grounded and random.random() < 0.25) else 0
 
                 # 4. Anti-spam & Distance attack heuristic: Only attack when weapon cooldown is >= 85%!
-                charge = self.reward_engine.get_attack_cooldown_charge()
                 atk_act = 1 if (det["in_attack_range"] and charge >= 0.85) else 0
 
                 return aim_act, move_act, jump_act, atk_act
