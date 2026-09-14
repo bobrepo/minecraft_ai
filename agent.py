@@ -185,6 +185,7 @@ class PvpAgent:
         # W-Tap state machine (resets sprint after attacks to chain KB hits)
         self.w_tap_ticks: int = 0
         self.is_w_tapping: bool = False
+        self._was_active: bool = False
 
         # Combat session video recorder (asynchronous non-blocking)
         self.video_writer: Optional[AsyncVideoWriter] = None
@@ -296,6 +297,7 @@ class PvpAgent:
 
         # 3. Hardware DirectInput Dispatch
         if self.is_active:
+            self._was_active = True
             if actions["dx"] != 0 or actions["dy"] != 0:
                 self.input_ctrl.move_mouse(int(actions["dx"]), int(actions["dy"]))
 
@@ -311,7 +313,9 @@ class PvpAgent:
             if actions["attack"]:
                 self.input_ctrl.attack_click()
         else:
-            self.input_ctrl.release_all()
+            if self._was_active:
+                self.input_ctrl.release_all(force=True)
+                self._was_active = False
 
         return {"detection": det, "actions": actions, "active": self.is_active}
 

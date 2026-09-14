@@ -190,23 +190,39 @@ class InputController:
         self.left_down()
         self.left_up()
 
-    def release_all(self):
-        """Safety failsafe: release all known keys and mouse buttons unconditionally."""
+    def release_all(self, force: bool = False):
+        """Safety failsafe: release keys and mouse buttons pressed by the AI.
+
+        Args:
+            force: If True, flushes all known scan codes even if untracked (e.g. on emergency stop).
+                   If False, only releases keys and mouse buttons that the AI actually pressed.
+        """
         extra = ctypes.c_ulong(0)
-        # Flush all registered scan codes to prevent stuck keys in DirectX
-        for code in SCAN_CODES.values():
+
+        # 1. Keyboard release: only send KEYUP if keys were pressed or force is requested
+        keys_to_flush = set()
+        if force:
+            keys_to_flush = set(SCAN_CODES.values())
+        elif self._pressed_keys:
+            keys_to_flush = {SCAN_CODES[k] for k in self._pressed_keys if k in SCAN_CODES}
+
+        for code in keys_to_flush:
             ii_ = Input_I()
             ii_.ki = KeyBdInput(0, code, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0, ctypes.pointer(extra))
             x = Input(ctypes.c_ulong(INPUT_KEYBOARD), ii_)
             ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
         self._pressed_keys.clear()
 
-        # Flush both left and right mouse buttons
-        ii_m = Input_I()
-        ii_m.mi = MouseInput(0, 0, 0, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP, 0, ctypes.pointer(extra))
-        x_m = Input(ctypes.c_ulong(INPUT_MOUSE), ii_m)
-        ctypes.windll.user32.SendInput(1, ctypes.pointer(x_m), ctypes.sizeof(x_m))
-        self._mouse_down = False
+        # 2. Mouse release: CRITICAL! NEVER send MOUSEEVENTF_LEFTUP unless the AI actually pressed it!
+        # Sending synthetic mouse-up when mouse wasn't down causes Windows to drop/trigger clicks!
+        if self._mouse_down:
+            ii_m = Input_I()
+            ii_m.mi = MouseInput(0, 0, 0, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP, 0, ctypes.pointer(extra))
+            x_m = Input(ctypes.c_ulong(INPUT_MOUSE), ii_m)
+            ctypes.windll.user32.SendInput(1, ctypes.pointer(x_m), ctypes.sizeof(x_m))
+            self._mouse_down = False
+        elif force:
+            self._mouse_down = False
 
 
 class EmergencyKillswitchListener:
@@ -230,9 +246,10 @@ class EmergencyKillswitchListener:
 
     def set_active(self, active: bool):
         """Programmatically update active state."""
+        prev = self.is_active
         self.is_active = active
-        if not active:
-            self.input_ctrl.release_all()
+        if prev and not active:
+            self.input_ctrl.release_all(force=True)
 
     def _monitor_loop(self):
         VK_F6 = 0x75
@@ -249,7 +266,7 @@ class EmergencyKillswitchListener:
                 if esc_down and not esc_prev:
                     if self.is_active:
                         self.is_active = False
-                        self.input_ctrl.release_all()
+                        self.input_ctrl.release_all(force=True)
                         try:
                             winsound.Beep(550, 160)
                         except Exception:
@@ -261,7 +278,8 @@ class EmergencyKillswitchListener:
                 # F6: Toggle Active / Paused
                 elif f6_down and not f6_prev:
                     self.is_active = not self.is_active
-                    self.input_ctrl.release_all()
+                    if not self.is_active:
+                        self.input_ctrl.release_all(force=True)
                     try:
                         if self.is_active:
                             winsound.Beep(1200, 100)

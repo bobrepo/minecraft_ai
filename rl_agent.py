@@ -240,6 +240,7 @@ class RLPvpAgent:
         self.cumulative_reward = 0.0
         self.step_count = 0
         self.last_loss = 0.0
+        self._was_active: bool = False
 
         # Asynchronous background GPU trainer (prevents 40ms blocking spikes in combat loop)
         self.async_trainer = AsyncTrainer(self, batch_size=32, interval_sec=0.05)
@@ -442,6 +443,7 @@ class RLPvpAgent:
 
                     # 4. Dispatch action if active
                     if active:
+                        self._was_active = True
                         action_dict = self.dispatch_action(action_tuple)
                         action_flags = self.reward_engine.record_action(
                             w=action_dict["w"],
@@ -475,7 +477,9 @@ class RLPvpAgent:
                             "sprint_reset_ready": self.reward_engine.sprint_reset_ready,
                             "cooldown_charge": self.reward_engine.get_attack_cooldown_charge(),
                         }
-                        self.input_ctrl.release_all()
+                        if self._was_active:
+                            self.input_ctrl.release_all(force=True)
+                            self._was_active = False
 
                     # 8. Update Desktop Keystrokes & Mousepad Overlay
                     if self.overlay:
