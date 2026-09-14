@@ -1,9 +1,9 @@
 @echo off
-title Minecraft AI - Window Capture & Recorder (20 TPS)
+title Minecraft AI - Window Capture and Recorder (20 TPS)
 cd /d "%~dp0"
 
 echo ========================================================
-echo   Minecraft AI: Real-Time Window Capture ^& Recorder
+echo   Minecraft AI: Real-Time Window Capture and Recorder
 echo   Tick Rate: 20 ticks/sec (50ms interval)
 echo ========================================================
 echo.

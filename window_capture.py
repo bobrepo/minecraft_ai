@@ -1,6 +1,6 @@
 """High-speed real-time window capture module for Windows.
 
-Uses Windows Win32 API, DWM, and MSS for low-latency client-area screen capture.
+Supports direct Window DC capture (PrintWindow) and MSS with coordinate clamping.
 """
 
 import ctypes
@@ -19,6 +19,7 @@ except Exception:
 import mss
 import win32con
 import win32gui
+import win32ui
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
@@ -32,7 +33,7 @@ except Exception:
     h_default_desk = None
 
 
-# Known internal/system windows to exclude
+# Known internal/system windows to exclude from selection
 IGNORE_TITLES = {
     "Default IME",
     "MSCTFIME UI",
@@ -51,7 +52,7 @@ IGNORE_TITLES = {
 
 
 def _is_cloaked(hwnd: int) -> bool:
-    """Check if window is cloaked (e.g., hidden UWP app or inactive virtual desktop)."""
+    """Check if window is cloaked (hidden UWP app or inactive virtual desktop)."""
     try:
         cloaked = ctypes.c_int(0)
         dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
@@ -64,7 +65,7 @@ def list_windows(include_minimized: bool = True) -> List[Tuple[int, str]]:
     """Enumerate visible application windows.
 
     Args:
-        include_minimized: If True, also includes minimized windows.
+        include_minimized: If True, includes minimized application windows.
 
     Returns:
         List of tuples containing (hwnd, window_title).
@@ -111,14 +112,10 @@ def list_windows(include_minimized: bool = True) -> List[Tuple[int, str]]:
 
 
 class WindowCapture:
-    """Captures a specific window's client area at high frame rates using MSS."""
+    """Captures a specific window at high frame rates."""
 
     def __init__(self, target: Optional[str | int] = None):
-        """Initialize capture for a window by title (substring) or HWND.
-
-        Args:
-            target: Window title substring or integer HWND. If None, uses active foreground window.
-        """
+        """Initialize capture for a window by title (substring) or HWND."""
         self.sct = mss.mss()
         self.hwnd: Optional[int] = None
         self.window_title: str = ""
@@ -135,93 +132,145 @@ class WindowCapture:
                 raise ValueError(f"Could not find window matching title: '{target}'")
             self.window_title = win32gui.GetWindowText(self.hwnd)
 
-        # Restore window if minimized
+        # Restore and activate window if minimized
         if self.hwnd and win32gui.IsIconic(self.hwnd):
-            print(f"[+] Restoring minimized window: '{self.window_title}'...")
+            print(f"[+] Restoring minimized window: '{self.window_title}'...", flush=True)
             win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+            try:
+                win32gui.SetForegroundWindow(self.hwnd)
+            except Exception:
+                pass
 
     def _find_window_by_title(self, query: str) -> Optional[int]:
         query_lower = query.lower()
         active_windows = list_windows(include_minimized=True)
 
-        # First try exact match
         for hwnd, title in active_windows:
-            clean_title = title.replace(" [Minimized]", "").strip()
-            if clean_title.lower() == query_lower:
+            clean = title.replace(" [Minimized]", "").strip().lower()
+            if clean == query_lower:
                 return hwnd
 
-        # Then try substring match
         for hwnd, title in active_windows:
-            clean_title = title.replace(" [Minimized]", "").strip()
-            if query_lower in clean_title.lower():
+            clean = title.replace(" [Minimized]", "").strip().lower()
+            if query_lower in clean:
                 return hwnd
 
         return None
 
     def is_valid(self) -> bool:
-        """Check if target window is still valid and open."""
+        """Check if target window is still open and valid."""
         if not self.hwnd or not win32gui.IsWindow(self.hwnd):
             return False
         return True
 
-    def get_client_rect(self) -> Optional[Dict[str, int]]:
-        """Get the current screen coordinates of the window's client area."""
+    def _capture_printwindow(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Capture directly from the window's DC using PrintWindow (captures window even if covered)."""
         if not self.is_valid():
-            return None
+            return False, None
 
         try:
-            # If minimized, client rect will be 0
-            if win32gui.IsIconic(self.hwnd):
-                return None
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            w = right - left
+            h = bottom - top
+            if w <= 10 or h <= 10:
+                return False, None
 
-            # Client area dimensions
-            _, _, width, height = win32gui.GetClientRect(self.hwnd)
-            if width <= 0 or height <= 0:
-                # Fallback to GetWindowRect if client rect is unavailable
-                rect = win32gui.GetWindowRect(self.hwnd)
-                width = rect[2] - rect[0]
-                height = rect[3] - rect[1]
-                if width <= 0 or height <= 0:
-                    return None
-                return {
-                    "top": int(rect[1]),
-                    "left": int(rect[0]),
-                    "width": int(width),
-                    "height": int(height),
-                }
+            hwnd_dc = win32gui.GetWindowDC(self.hwnd)
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
 
-            # Convert (0, 0) of client area to screen coordinates
-            screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
+            save_bitmap = win32ui.CreateBitmap()
+            save_bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(save_bitmap)
 
-            return {
-                "top": int(screen_y),
-                "left": int(screen_x),
-                "width": int(width),
-                "height": int(height),
-            }
+            # PW_RENDERFULLCONTENT = 2
+            result = user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 2)
+            if not result:
+                result = user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 1)
+
+            if result:
+                bmpinfo = save_bitmap.GetInfo()
+                bmpstr = save_bitmap.GetBitmapBits(True)
+                img = np.frombuffer(bmpstr, dtype=np.uint8).reshape((bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4))
+                frame = np.ascontiguousarray(img[:, :, :3])
+            else:
+                frame = None
+
+            # Clean up Windows GDI resources
+            win32gui.DeleteObject(save_bitmap.GetHandle())
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(self.hwnd, hwnd_dc)
+
+            if frame is not None and frame.size > 0:
+                return True, frame
+            return False, None
         except Exception:
-            return None
+            return False, None
+
+    def _capture_mss(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Capture via MSS screen crop with coordinate boundary clamping."""
+        if not self.is_valid():
+            return False, None
+
+        try:
+            _, _, w, h = win32gui.GetClientRect(self.hwnd)
+            if w <= 10 or h <= 10:
+                rect = win32gui.GetWindowRect(self.hwnd)
+                w = rect[2] - rect[0]
+                h = rect[3] - rect[1]
+                screen_x, screen_y = rect[0], rect[1]
+            else:
+                screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
+
+            # Clamp coordinates to primary screen bounds to prevent BitBlt errors
+            mon = self.sct.monitors[1] if len(self.sct.monitors) > 1 else self.sct.monitors[0]
+            mon_left = mon["left"]
+            mon_top = mon["top"]
+            mon_right = mon_left + mon["width"]
+            mon_bottom = mon_top + mon["height"]
+
+            clamped_left = max(mon_left, int(screen_x))
+            clamped_top = max(mon_top, int(screen_y))
+            clamped_right = min(mon_right, int(screen_x + w))
+            clamped_bottom = min(mon_bottom, int(screen_y + h))
+
+            clamped_w = clamped_right - clamped_left
+            clamped_h = clamped_bottom - clamped_top
+
+            if clamped_w <= 10 or clamped_h <= 10:
+                return False, None
+
+            box = {
+                "top": clamped_top,
+                "left": clamped_left,
+                "width": clamped_w,
+                "height": clamped_h,
+            }
+
+            raw_shot = self.sct.grab(box)
+            frame = np.frombuffer(raw_shot.raw, dtype=np.uint8).reshape((raw_shot.height, raw_shot.width, 4))
+            return True, np.ascontiguousarray(frame[:, :, :3])
+        except Exception:
+            return False, None
 
     def get_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
         """Capture one frame of the target window.
 
-        Returns:
-            Tuple of (success: bool, frame: np.ndarray in BGR format or None).
+        Tries PrintWindow first (avoids obstruction by other windows),
+        falling back to clamped MSS capture if PrintWindow is unsupported.
         """
-        rect = self.get_client_rect()
-        if rect is None:
-            return False, None
+        success, frame = self._capture_printwindow()
+        if success and frame is not None and not np.all(frame == 0):
+            return True, frame
 
-        try:
-            # Fast capture via MSS
-            raw_shot = self.sct.grab(rect)
-            frame = np.frombuffer(raw_shot.raw, dtype=np.uint8).reshape((raw_shot.height, raw_shot.width, 4))
-            frame_bgr = np.ascontiguousarray(frame[:, :, :3])
-            return True, frame_bgr
-        except Exception:
-            return False, None
+        # Fallback to clamped MSS
+        return self._capture_mss()
 
     def close(self):
-        """Release MSS resources."""
+        """Release capture resources."""
         if self.sct:
-            self.sct.close()
+            try:
+                self.sct.close()
+            except Exception:
+                pass
