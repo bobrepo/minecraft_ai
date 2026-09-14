@@ -4,20 +4,19 @@ Minecraft 1.9–1.21 Combat Mechanics & Pure Aim-Centric Reward Rubric:
 ====================================================================================================
 Event / Action               | Condition                                 | RL Reward   | Description
 -----------------------------+-------------------------------------------+-------------+--------------------------------------------
-Dead-Center Crosshair Lock   | Target center <= 35px from crosshair      | +15.0 /tick | Pure Aim: keeps crosshair locked on enemy
-On-Body Aim Tracking         | Target distance 35px - 80px               | +8.0-+15.0  | Smooth gradient tracking on target body
-In-Frame Pursuit Aim         | Target distance 80px - 180px              | +2.0-+8.0   | Smooth guidance toward crosshair center
-Predictive Target Intercept  | Re-acquires target after trajectory loss  |  +6.0 pts   | Reward for predicting & looking at target
-Predictive Search Guidance   | Steers toward predicted target location   |  +1.0 /tick | Encourages turning toward fleeing enemy
-Off-Target / Lost Penalty    | Distance > 180px or spinning blindly      | -0.5--1.0   | Punishes looking away from opponent
-Spam Attack Penalty          | Attack when weapon cooldown < 85%         |  -2.0 pts   | Penalizes spam-clicking without timing
-Anti-Bunny-Hop Jump Spam     | Repeated mid-air jump / uncharged jump    |  -2.0 pts   | Penalizes jump spam without critical timing
-Whiff / Miss Swing           | Attack when target not in 3-block reach   |  -1.0 pt    | Penalizes swinging at empty air
-Spacing Violation            | Box height > 320px (overcrowded inside)   |  -0.2 /tick | Penalizes face-hugging inside hitbox
-W-Tap Sprint Reset           | Any W release / re-engage                 |   0.0 pts   | NO REWARD (disabled per user request)
-Evasive Circle-Strafing      | Lateral movement (A or D)                 |   0.0 /tick | NO REWARD (disabled per user request)
-Distance Attack Swing        | Attack swing initiated at distance        |   0.0 pts   | NO REWARD (disabled per user request)
-Attack Hits (KB/Crit/Sweep)  | Confirmed damage hits on enemy            |   0.0 pts   | Badge only (all rewards for looking at enemy)
+Dead-Center Crosshair Lock   | Target center <= 35px from crosshair      | +15.0 /tick | Pure Aim (HIGH): keeps crosshair locked on enemy
+On-Body Aim Tracking         | Target distance 35px - 80px               | +8.0-+15.0  | Pure Aim (HIGH): smooth gradient tracking on body
+In-Frame Pursuit Aim         | Target distance 80px - 180px              | +2.0-+8.0   | Pure Aim (HIGH): smooth guidance toward center
+Predictive Target Intercept  | Re-acquires target after trajectory loss  |  +6.0 pts   | Pure Aim (HIGH): looking at & re-acquiring target
+Predictive Search Guidance   | Steers toward predicted target location   |  +1.0 /tick | Pure Aim: encourages turning toward fleeing enemy
+Off-Target Look Away Penalty | Distance > 180px                          |  -1.0 /tick | NEGATIVE: punishes looking away from enemy
+Target Lost / Blind Search   | Enemy not in view                         |  -1.0 /tick | NEGATIVE: punishes losing sight of enemy
+Spam Attack Penalty          | Attack when weapon cooldown < 85%         |  -2.0 pts   | NEGATIVE: penalizes spam-clicking
+Anti-Bunny-Hop Jump Spam     | Repeated mid-air jump / uncharged jump    |  -2.0 pts   | NEGATIVE: penalizes jump spam
+Whiff / Miss Swing Penalty   | Attack when target not in reach           |  -2.0 pts   | NEGATIVE: penalizes swinging at empty air
+Overcrowded Spacing Penalty  | Box height > 320px                        |  -0.5 /tick | NEGATIVE: penalizes face-hugging inside hitbox
+Too Far Spacing Penalty      | Box height < 120px                        |  -0.5 /tick | NEGATIVE: penalizes drifting away from combat
+W-Tap / Strafe / Hits        | Any movement or hit events                |   0.0 pts   | NO POSITIVE REWARD (only looking is high)
 ====================================================================================================
 """
 
@@ -47,10 +46,9 @@ class TargetTrajectoryPredictor:
         self.was_tracking: bool = False
 
     def update(self, det: Dict[str, Any]) -> Dict[str, Any]:
-        """Update tracker with latest visual detection frame and return trajectory prediction."""
         if det.get("has_target", False):
-            cur_x = float(det["target_x"])
-            cur_y = float(det["target_y"])
+            cur_x = float(det.get("target_x", self.cx + float(det.get("dx", 0.0))))
+            cur_y = float(det.get("target_y", self.cy + float(det.get("dy", 0.0))))
 
             # Check if target was re-acquired along predicted trajectory
             reacquired_predicted = False
@@ -406,12 +404,13 @@ class PvPRewardEngine:
                 if hit_type == "none":
                     hit_type = "pred_acquisition"
 
-            # 4. Optimal Spacing (~3 blocks reach distance, scaled down to +0.5)
-            # 4. Spacing Penalty if overcrowded (no positive spacing reward)
+            # 4. Spacing Penalty: NEGATIVE if face-hugging or too far (no positive spacing reward)
             target_h = det.get("box_h", 0.0)
             self.last_target_height = target_h
             if target_h > 320:
-                r_dist = -0.2  # Spacing penalty for face-hugging inside hitbox
+                r_dist = -0.5  # Negative penalty for face-hugging inside enemy hitbox
+            elif 0 < target_h < 120:
+                r_dist = -0.5  # Negative penalty for drifting too far out of combat
             else:
                 r_dist = 0.0
 
@@ -441,12 +440,12 @@ class PvPRewardEngine:
                 r_hit = 0.0
 
             elif actions.get("attack") and not det.get("in_attack_range", False):
-                r_hit = -1.0
+                r_hit = -2.0  # NEGATIVE: Whiff penalty
                 if hit_type == "none":
                     hit_type = "whiff"
 
         else:
-            # Target NOT currently visible: check trajectory prediction
+            # Target NOT currently visible: NEGATIVE penalty for losing visual lock on enemy!
             if pred_info.get("is_predicting", False) and pred_info.get("confidence", 0.0) > 0.15:
                 # Target recently lost: award predictive search guidance if steering along trajectory
                 act_dx = float(actions.get("dx", 0.0))
@@ -464,17 +463,17 @@ class PvPRewardEngine:
                         if hit_type == "none":
                             hit_type = "pred_tracking"
                     else:
-                        # Steering away from predicted target
-                        r_aim = -0.5
+                        # Steering away from predicted target: NEGATIVE penalty
+                        r_aim = -1.0
                 else:
-                    # Inactive while target was recently fleeing
-                    r_aim = -0.3
+                    # Inactive while target was recently fleeing: NEGATIVE penalty
+                    r_aim = -1.0
             else:
-                # Fully lost and spinning without active prediction
-                r_aim = -0.5
+                # Fully lost and spinning blindly: NEGATIVE penalty
+                r_aim = -1.0
 
             if actions.get("attack"):
-                r_hit = -1.0
+                r_hit = -2.0  # NEGATIVE: Whiff penalty
                 if hit_type == "none":
                     hit_type = "whiff"
 
