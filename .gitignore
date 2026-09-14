@@ -1,0 +1,36 @@
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Jupyter / IPython
+.ipynb_checkpoints
+
+# Datasets and model checkpoints
+data/
+checkpoints/
+models/*.pth
+models/*.pt
+*.onnx
+
+# Logs & monitoring
+runs/
+logs/
+*.log
+
+# Environments / local settings
+.env
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+torch
+torchvision
+torchaudio
+numpy
+pillow
+opencv-python
+matplotlib
