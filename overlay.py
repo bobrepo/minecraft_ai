@@ -28,9 +28,9 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     root.configure(bg="#18181b")
 
     # Geometry constants
-    width = 252
+    width = 264
     collapsed_h = 46
-    expanded_h = 508
+    expanded_h = 532
 
     # Initial position: top-left with safe margins
     pos_x = 24
@@ -51,6 +51,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         "event_timer": 0,
         "score": 0.0,
         "reward": 0.0,
+        "tps": 20.0,
     }
 
     # --- Header / Movable Bar ---
@@ -59,19 +60,24 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     header.pack_propagate(False)
 
     drag_icon = tk.Label(
-        header, text="⋮⋮ ⚔️ PVP", fg="#f4f4f5", bg="#27272a", font=("Segoe UI", 10, "bold"), cursor="fleur"
+        header, text="⋮⋮ ⚔️", fg="#f4f4f5", bg="#27272a", font=("Segoe UI", 9, "bold"), cursor="fleur"
     )
-    drag_icon.pack(side=tk.LEFT, padx=(8, 2), pady=6)
+    drag_icon.pack(side=tk.LEFT, padx=(6, 2), pady=6)
 
     status_pill = tk.Label(
         header, text="○ OFF", fg="#a1a1aa", bg="#27272a", font=("Segoe UI", 8, "bold")
     )
-    status_pill.pack(side=tk.LEFT, padx=4)
+    status_pill.pack(side=tk.LEFT, padx=2)
+
+    tps_pill = tk.Label(
+        header, text="20.0 TPS", fg="#38bdf8", bg="#27272a", font=("Segoe UI", 8, "bold")
+    )
+    tps_pill.pack(side=tk.LEFT, padx=2)
 
     header_score_lbl = tk.Label(
         header, text="", fg="#fbbf24", bg="#27272a", font=("Segoe UI", 8, "bold")
     )
-    header_score_lbl.pack(side=tk.LEFT, padx=4)
+    header_score_lbl.pack(side=tk.LEFT, padx=2)
 
     # Close button (signals agent to stop and quit)
     def on_close_click():
@@ -257,7 +263,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
 
     # 4. Left Click Indicator Box (bottom of mouse pad)
     lmb_frame = tk.Frame(content_frame, bg="#18181b")
-    lmb_frame.pack(fill=tk.X, padx=10, pady=(4, 8))
+    lmb_frame.pack(fill=tk.X, padx=10, pady=(4, 6))
     lmb_box = tk.Label(
         lmb_frame,
         text="⚡ LEFT CLICK (ATTACK)",
@@ -269,6 +275,20 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         bd=1,
     )
     lmb_box.pack(fill=tk.X)
+
+    # 5. Footer Stats Strip (TPS & Rate indicator)
+    footer_frame = tk.Frame(content_frame, bg="#18181b")
+    footer_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+    tps_lbl = tk.Label(
+        footer_frame, text="⚡ RATE: 20.0 TPS", bg="#18181b", fg="#38bdf8", font=("Segoe UI", 8, "bold")
+    )
+    tps_lbl.pack(side=tk.LEFT)
+
+    tick_time_lbl = tk.Label(
+        footer_frame, text="50.0ms / tick", bg="#18181b", fg="#71717a", font=("Segoe UI", 8)
+    )
+    tick_time_lbl.pack(side=tk.RIGHT)
 
     def update_window_expansion():
         should_expand = state["active"] or state["pinned"]
@@ -346,12 +366,22 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                             state["lmb_flash"] = 4
                             lmb_box.config(bg="#ef4444", fg="#ffffff", relief=tk.SUNKEN)
 
-                        # Target Sensing
+                        # Target Sensing with 3D Spatial Vector & Distance Guessing
                         locked = msg.get("target_locked", False)
                         dist = msg.get("target_dist", 0.0)
                         predicting = msg.get("predicting", False)
                         pred_dir = msg.get("pred_direction", "CENTER")
-                        if locked:
+                        pos_3d = msg.get("pos_3d")
+                        is_guess = msg.get("is_guessing", False)
+                        phase = msg.get("phase", "")
+
+                        if locked and pos_3d:
+                            tag = "~" if is_guess else ""
+                            target_lbl.config(
+                                text=f"TGT: {pos_3d['x_rel']:+.1f}x {pos_3d['y_rel']:+.1f}y {tag}{pos_3d['z_rel']:.1f}z",
+                                fg="#38bdf8" if is_guess else "#22c55e",
+                            )
+                        elif locked:
                             target_lbl.config(text=f"Target: 🎯 {dist:.1f} blk", fg="#22c55e")
                         elif predicting:
                             target_lbl.config(text=f"Target: ⤑ {pred_dir}", fg="#06b6d4")
@@ -365,7 +395,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         cd_canvas.coords(cd_bar, 0, 0, bw, 6)
                         cd_canvas.itemconfig(cd_bar, fill=b_color)
 
-                        # Combat Event
+                        # Combat Event & Tactical Context Phase
                         ht = msg.get("hit_type", "")
                         if ht and ht != "none":
                             state["event_text"] = ht.upper().replace("_", " ")
@@ -382,6 +412,21 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                                 state["event_color"] = "#06b6d4"
                             else:
                                 state["event_color"] = "#eab308"
+                        elif state["event_timer"] <= 0 and phase:
+                            # Show tactical phase when no hit flash
+                            short_phase = phase.replace("_", " ")
+                            state["event_text"] = f"[{short_phase}]"
+                            if "PURSUIT" in phase:
+                                state["event_color"] = "#06b6d4"
+                            elif "ENGAGE" in phase:
+                                state["event_color"] = "#10b981"
+                            elif "COMBO" in phase:
+                                state["event_color"] = "#a855f7"
+                            elif "RESET" in phase:
+                                state["event_color"] = "#f59e0b"
+                            else:
+                                state["event_color"] = "#71717a"
+                            event_lbl.config(text=state["event_text"], fg=state["event_color"])
 
                         # RL Rewards & Points Display
                         r_val = float(msg.get("reward", 0.0))
@@ -407,6 +452,16 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         score_lbl.config(text=f"POINTS: {sign}{s_val:,.0f}", fg=s_col)
                         if state["active"]:
                             header_score_lbl.config(text=f"[{sign}{s_val:,.0f} pts]")
+
+                        # Live TPS Rate Display
+                        cur_tps = float(msg.get("tps", 20.0))
+                        state["tps"] = cur_tps
+                        tps_col = "#38bdf8" if cur_tps >= 19.4 else ("#fbbf24" if cur_tps >= 16.5 else "#ef4444")
+                        tps_pill.config(text=f"{cur_tps:.1f} TPS", fg=tps_col)
+                        if state["active"] or state["pinned"]:
+                            tps_lbl.config(text=f"⚡ RATE: {cur_tps:.1f} TPS", fg=tps_col)
+                            ms_tick = 1000.0 / max(1.0, cur_tps)
+                            tick_time_lbl.config(text=f"{ms_tick:.1f}ms / tk")
 
         except Exception:
             pass
@@ -491,6 +546,10 @@ class PvPOverlayClient:
         pred_direction: str = "CENTER",
         reward: float = 0.0,
         total_score: float = 0.0,
+        tps: float = 20.0,
+        pos_3d: Optional[Dict[str, float]] = None,
+        is_guessing: bool = False,
+        phase: str = "",
     ):
         """Enqueue state update for overlay rendering (takes <0.005ms)."""
         if not self._is_running:
@@ -516,6 +575,10 @@ class PvPOverlayClient:
             "pred_direction": pred_direction,
             "reward": float(reward),
             "total_score": float(total_score),
+            "tps": float(tps),
+            "pos_3d": pos_3d,
+            "is_guessing": is_guessing,
+            "phase": phase,
         }
         try:
             self._data_queue.put_nowait(msg)
