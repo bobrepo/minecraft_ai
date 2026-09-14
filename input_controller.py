@@ -82,12 +82,86 @@ SCAN_CODES: Dict[str, int] = {
 }
 
 
+class SubTickMouseThread(threading.Thread):
+    """High-frequency (120 Hz) background thread for biological Minimum-Jerk camera movement.
+
+    Interpolates aim deltas smoothly across monitor refresh frames (~8.3ms) rather than jumping
+    abruptly once every 50ms combat tick. Uses Flash & Hogan's Minimum-Jerk polynomial and
+    a Bresenham-style fractional accumulator to conserve 100% of integer mouse pixels.
+    """
+
+    def __init__(self, send_raw_fn: Callable[[int, int], None]):
+        super().__init__(daemon=True)
+        self.send_raw = send_raw_fn
+        self.lock = threading.Lock()
+        self.active = False
+        self.total_dx = 0.0
+        self.total_dy = 0.0
+        self.duration = 0.045
+        self.start_time = 0.0
+        self.prev_p = 0.0
+        self.accum_x = 0.0
+        self.accum_y = 0.0
+        self.running = True
+
+    @staticmethod
+    def _min_jerk_poly(s: float) -> float:
+        """Flash & Hogan Minimum-Jerk position polynomial: 10s^3 - 15s^4 + 6s^5."""
+        return 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
+
+    def submit_aim(self, dx: float, dy: float, duration_sec: float = 0.045):
+        """Submit new aim delta to be dispatched over duration_sec via minimum jerk."""
+        with self.lock:
+            # If an existing trajectory was active, blend any residual fractional pixels
+            rem_dx = (self.total_dx * (1.0 - self.prev_p)) if self.active else 0.0
+            rem_dy = (self.total_dy * (1.0 - self.prev_p)) if self.active else 0.0
+
+            self.total_dx = float(dx) + rem_dx
+            self.total_dy = float(dy) + rem_dy
+            self.duration = max(0.015, float(duration_sec))
+            self.start_time = time.perf_counter()
+            self.prev_p = 0.0
+            self.active = (self.total_dx != 0.0 or self.total_dy != 0.0)
+
+    def run(self):
+        while self.running:
+            with self.lock:
+                if self.active:
+                    now = time.perf_counter()
+                    elapsed = now - self.start_time
+                    s = min(1.0, elapsed / self.duration)
+                    p = self._min_jerk_poly(s)
+                    dp = p - self.prev_p
+                    self.prev_p = p
+
+                    self.accum_x += self.total_dx * dp
+                    self.accum_y += self.total_dy * dp
+
+                    sx = int(round(self.accum_x))
+                    sy = int(round(self.accum_y))
+                    self.accum_x -= sx
+                    self.accum_y -= sy
+
+                    if sx != 0 or sy != 0:
+                        self.send_raw(sx, sy)
+
+                    if s >= 1.0:
+                        self.active = False
+            time.sleep(0.007)  # ~140 Hz sub-tick update interval
+
+    def stop(self):
+        self.running = False
+
+
 class InputController:
     """Controls Minecraft keyboard and 3D camera mouse inputs safely."""
 
     def __init__(self):
         self._pressed_keys: Set[str] = set()
         self._mouse_down: bool = False
+        # Minimum-Jerk Sub-Tick Thread running at ~140 Hz
+        self.mouse_thread = SubTickMouseThread(self._send_mouse_raw)
+        self.mouse_thread.start()
 
     def press_key(self, key: str):
         """Send keydown event with hardware scan code."""
@@ -164,10 +238,10 @@ class InputController:
         ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
 
     def move_mouse(self, dx: float | int, dy: float | int, dynamic: bool = True):
-        """Rotate first-person 3D camera with dynamic sub-tick micro-step smoothing.
+        """Rotate first-person 3D camera with biological Minimum-Jerk sub-tick smoothing.
 
-        Splits larger aim deltas (>22px) into 2-3 rapid micro-packets (1ms delay)
-        to eliminate camera skipping in Minecraft and produce fluid, human-like tracking.
+        Dispatches mouse deltas smoothly across monitor frames via a 140 Hz background
+        thread to eliminate camera tearing, skipping, and jitter in Minecraft.
         """
         dx_val = float(dx)
         dy_val = float(dy)
@@ -177,24 +251,9 @@ class InputController:
         # Clamp vertical deflection per tick to prevent over-pitching into zenith or nadir
         dy_val = max(-65.0, min(65.0, dy_val))
 
-        mag = (dx_val * dx_val + dy_val * dy_val) ** 0.5
-        if dynamic and mag > 22.0:
-            steps = 3 if mag > 55.0 else 2
-            step_dx = dx_val / steps
-            step_dy = dy_val / steps
-            accum_x, accum_y = 0, 0
-            for i in range(steps):
-                if i == steps - 1:
-                    cx = int(round(dx_val - accum_x))
-                    cy = int(round(dy_val - accum_y))
-                else:
-                    cx = int(round(step_dx))
-                    cy = int(round(step_dy))
-                    accum_x += cx
-                    accum_y += cy
-                self._send_mouse_raw(cx, cy)
-                if i < steps - 1:
-                    time.sleep(0.001)
+        if dynamic and hasattr(self, "mouse_thread") and self.mouse_thread.is_alive():
+            # Submit to Minimum-Jerk Sub-Tick Thread (duration 45ms matches 50ms combat tick)
+            self.mouse_thread.submit_aim(dx_val, dy_val, duration_sec=0.045)
         else:
             self._send_mouse_raw(int(round(dx_val)), int(round(dy_val)))
 
@@ -258,6 +317,10 @@ class InputController:
             self._mouse_down = False
         elif force:
             self._mouse_down = False
+
+        if hasattr(self, "mouse_thread"):
+            with self.mouse_thread.lock:
+                self.mouse_thread.active = False
 
 
 class EmergencyKillswitchListener:

@@ -49,6 +49,16 @@ class VisionDetector:
         confidence: float = 0.0
         det_type: str = "none"
 
+        # Calculate sky color dominance (Minecraft day sky: B > 175, B > R + 40, G > 115)
+        b_ch = frame[:, :, 0].astype(np.int16)
+        g_ch = frame[:, :, 1].astype(np.int16)
+        r_ch = frame[:, :, 2].astype(np.int16)
+        sky_mask = (b_ch > 175) & (b_ch > r_ch + 40) & (g_ch > 115) & (r_ch < 175)
+        total_sky_ratio = float(np.mean(sky_mask))
+        lower_sky_ratio = float(np.mean(sky_mask[int(h * 0.45):, :]))
+        # Facing sky if entire screen is dominated by sky (>65%) or horizon dropped below crosshair (>38% sky in lower half)
+        is_facing_sky = (total_sky_ratio > 0.65) or (lower_sky_ratio > 0.38)
+
         # --- Fast Detection Strategy 1: F3+B Red Eye-Level Line ---
         red_mask = cv2.inRange(roi, self.lower_red, self.upper_red)
 
@@ -85,7 +95,8 @@ class VisionDetector:
             det_type = "f3b_eyeline"
 
         # --- Fast Detection Strategy 2: White Hitbox Wireframe (F3+B) ---
-        if target_x is None:
+        # Strictly disabled when staring up at sky to reject sun/clouds
+        if target_x is None and not is_facing_sky:
             white_mask = cv2.inRange(roi, self.lower_white, self.upper_white)
             white_mask[
                 max(0, roi_ch_y - ch_r):min(roi_h, roi_ch_y + ch_r),
@@ -98,14 +109,26 @@ class VisionDetector:
 
             for c in white_contours:
                 bx, by, bw, bh = cv2.boundingRect(c)
-                if (bw > 20 and bh > 30) or (bw > 40 and bh > 12):
-                    center_x = bx + bw / 2.0
-                    center_y = (by + y1) + bh / 2.0
-                    dist_to_center = np.hypot(center_x - ch_x, center_y - ch_y)
-                    score = (bw * bh) / (1.0 + dist_to_center * 0.3)
-                    if score > best_score:
-                        best_score = score
-                        best_white_box = (bx, by + y1, bw, bh)
+                aspect = bh / max(1.0, float(bw))
+                fill_ratio = cv2.contourArea(c) / max(1.0, float(bw * bh))
+                # Reject solid shapes (sun/clouds) and flat horizontal text:
+                # A Minecraft humanoid player wireframe has aspect >= 1.4 and hollow fill < 0.32
+                if bw >= 16 and bh >= 28 and aspect >= 1.4 and fill_ratio < 0.32:
+                    # Verify interior is not pure sky blue
+                    box_roi = roi[by:by+bh, bx:bx+bw]
+                    if box_roi.size > 0:
+                        b_b = box_roi[:, :, 0].astype(np.int16)
+                        g_b = box_roi[:, :, 1].astype(np.int16)
+                        r_b = box_roi[:, :, 2].astype(np.int16)
+                        box_sky = (b_b > 175) & (b_b > r_b + 40) & (g_b > 115)
+                        if np.mean(box_sky) < 0.60:
+                            center_x = bx + bw / 2.0
+                            center_y = (by + y1) + bh / 2.0
+                            dist_to_center = np.hypot(center_x - ch_x, center_y - ch_y)
+                            score = (bw * bh) / (1.0 + dist_to_center * 0.3)
+                            if score > best_score:
+                                best_score = score
+                                best_white_box = (bx, by + y1, bw, bh)
 
             if best_white_box is not None:
                 bx, by, bw, bh = best_white_box
@@ -129,6 +152,7 @@ class VisionDetector:
                 "confidence": 0.0,
                 "type": "none",
                 "in_attack_range": False,
+                "is_facing_sky": is_facing_sky,
             }
 
         # Calculate crosshair aiming deltas
@@ -154,6 +178,7 @@ class VisionDetector:
             "confidence": confidence,
             "type": det_type,
             "in_attack_range": in_attack_range,
+            "is_facing_sky": is_facing_sky,
         }
 
     def draw_hud(self, frame: np.ndarray, det: Dict[str, Any], actions: Optional[Dict[str, bool]] = None) -> np.ndarray:
