@@ -18,11 +18,11 @@ echo   Critical Hit:         +25.0 (jumping / falling attack)
 echo   Knockback Hit:        +40.0 (sprint attack)
 echo   Miss / Whiff:         -2.0  (swinging out of reach)
 echo ========================================================
-echo.
 echo Controls:
-echo   [F6]   : TOGGLE RL BOT ON / OFF (Emergency Killswitch)
-echo   [q]    : Quit & Save Weights (in HUD window)
-echo   Ctrl+C : Stop Agent in terminal
+echo   [RUN AI] Button : Click on the Desktop Overlay to Start/Stop
+echo   [F6]            : TOGGLE RL BOT ON / OFF (Audio Beep Feedback)
+echo   [ESC]           : INSTANT EMERGENCY STOP (Pauses & releases all keys)
+echo   [x] / Ctrl+C    : Stop Agent & Save Weights
 echo ========================================================
 echo.
 

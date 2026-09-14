@@ -7,11 +7,11 @@ echo   Minecraft AI: Autonomous PvP Combat Agent
 echo   Tick Rate:  20 decisions/sec (50ms interval)
 echo   Resolution: 640x480
 echo ========================================================
-echo.
 echo Controls:
-echo   [F6]   : TOGGLE AI ON / OFF (Emergency Killswitch)
-echo   [q]    : Quit Agent (in preview HUD window)
-echo   Ctrl+C : Stop Agent in this command prompt
+echo   [RUN AI] Button : Click on the Desktop Overlay to Start/Stop
+echo   [F6]            : TOGGLE AI ON / OFF (Audio Beep Confirmation)
+echo   [ESC]           : INSTANT EMERGENCY STOP (Pauses & releases all keys)
+echo   [x] / Ctrl+C    : Stop Agent cleanly
 echo ========================================================
 echo.
 

@@ -24,6 +24,7 @@ import torch
 
 from input_controller import EmergencyKillswitchListener, InputController
 from model import MinecraftPvPCNN
+from overlay import PvPOverlayClient
 from vision_detector import VisionDetector
 from window_capture import WindowCapture, is_minecraft_window, list_windows
 
@@ -131,6 +132,7 @@ class PvpAgent:
         spam_click: bool = False,
         record_combat: bool = True,
         model_path: Optional[str] = None,
+        use_overlay: bool = True,
     ):
         self.width, self.height = resolution
         self.aim_kp = aim_kp
@@ -138,11 +140,18 @@ class PvpAgent:
         self.max_aim_delta = max_aim_delta
         self.attack_cooldown = 0.05 if spam_click else attack_cooldown
         self.record_combat = record_combat
+        self.use_overlay = use_overlay
 
         # Controllers & Failsafe Listener
         self.input_ctrl = InputController()
         self.killswitch = EmergencyKillswitchListener(self.input_ctrl)
         self.detector = VisionDetector(resolution)
+
+        # Desktop PvP Keystrokes & Mousepad Overlay
+        self.overlay: Optional[PvPOverlayClient] = None
+        if self.use_overlay:
+            self.overlay = PvPOverlayClient()
+            self.overlay.start()
 
         # PyTorch Neural Network
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -332,15 +341,53 @@ class PvpAgent:
                     print("[!] Target window closed. Stopping agent.", flush=True)
                     break
 
+                # 0. Check interactive commands from desktop overlay
+                if self.overlay:
+                    for cmd in self.overlay.poll_commands():
+                        action = cmd.get("action")
+                        if action == "set_active":
+                            val = bool(cmd.get("value", False))
+                            self.killswitch.set_active(val)
+                            status_str = "ACTIVE (FIGHTING)" if val else "PAUSED"
+                            print(f"\n[AI STATE TOGGLED VIA OVERLAY: {status_str}]", flush=True)
+                        elif action == "quit":
+                            print("\n[!] Overlay exit clicked. Stopping agent...", flush=True)
+                            return
+
                 active = self.is_active
 
                 success, frame = self.cap.get_frame()
                 if success and frame is not None:
                     step_result = self.step(frame)
+                    det = step_result["detection"]
+                    actions = step_result["actions"]
+
+                    # Cooldown calculation
+                    now = time.perf_counter()
+                    elapsed = now - self.last_attack_time
+                    ratio = min(1.0, elapsed / max(0.001, self.attack_cooldown))
+
+                    # Update Desktop Keystrokes & Mousepad Overlay
+                    if self.overlay:
+                        target_dist = round(550.0 / max(30.0, float(det.get("box_h", 0))), 1) if det["has_target"] else 0.0
+                        self.overlay.update(
+                            active=active,
+                            w=actions.get("w", False),
+                            s=actions.get("s", False),
+                            a=actions.get("a", False),
+                            d=actions.get("d", False),
+                            sprint=actions.get("sprint", False),
+                            space=actions.get("jump", False),
+                            attack=actions.get("attack", False),
+                            dx=actions.get("dx", 0),
+                            dy=actions.get("dy", 0),
+                            target_locked=det["has_target"],
+                            target_dist=target_dist,
+                            cooldown=ratio,
+                            hit_type="knockback" if (actions.get("attack") and self.is_w_tapping) else "none",
+                        )
 
                     if preview:
-                        det = step_result["detection"]
-                        actions = step_result["actions"]
                         hud = self.detector.draw_hud(frame, det, actions)
 
                         state_color = (0, 255, 0) if active else (0, 255, 255)
@@ -348,9 +395,6 @@ class PvpAgent:
                         cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2)
 
                         # Attack Cooldown Meter
-                        now = time.perf_counter()
-                        elapsed = now - self.last_attack_time
-                        ratio = min(1.0, elapsed / max(0.001, self.attack_cooldown))
                         bars = int(ratio * 10)
                         meter_str = f"Atk Cooldown: [{'|' * bars}{'.' * (10 - bars)}] {int(ratio * 100)}%"
                         meter_color = (0, 255, 0) if ratio >= 0.85 else (0, 0, 255)
@@ -375,13 +419,16 @@ class PvpAgent:
         except KeyboardInterrupt:
             print("\n[+] Stop signal (Ctrl+C) received.", flush=True)
         finally:
+            if self.overlay:
+                self.overlay.stop()
             self.killswitch.stop()
             self.input_ctrl.release_all()
             if self.video_writer:
                 self.video_writer.release()
                 print(f"[+] Combat recording saved: {self.rec_path}", flush=True)
             self.cap.close()
-            cv2.destroyAllWindows()
+            if preview:
+                cv2.destroyAllWindows()
             print("[+] PvP Agent cleanly terminated. All keys released.", flush=True)
 
 
@@ -395,7 +442,8 @@ def main():
     parser.add_argument("--cooldown", type=float, default=0.35, help="Attack punch cooldown in seconds (default: 0.35s)")
     parser.add_argument("--spam-click", action="store_true", help="Enable rapid spam-clicking (1.8 PvP mode)")
     parser.add_argument("--no-record", action="store_true", help="Disable automatic combat session recording")
-    parser.add_argument("--no-preview", action="store_true", help="Disable preview HUD window")
+    parser.add_argument("--cv-hud", action="store_true", help="Display legacy OpenCV HUD debug window")
+    parser.add_argument("--no-overlay", action="store_true", help="Disable desktop keystrokes overlay")
 
     args = parser.parse_args()
     agent = PvpAgent(
@@ -408,8 +456,9 @@ def main():
         spam_click=args.spam_click,
         record_combat=not args.no_record,
         model_path=args.model,
+        use_overlay=not args.no_overlay,
     )
-    agent.run(preview=not args.no_preview)
+    agent.run(preview=args.cv_hud)
 
 
 if __name__ == "__main__":

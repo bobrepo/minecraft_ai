@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from input_controller import EmergencyKillswitchListener, InputController
+from overlay import PvPOverlayClient
 from reward_system import PvPRewardEngine
 from vision_detector import VisionDetector
 from window_capture import WindowCapture, is_minecraft_window, list_windows
@@ -185,6 +186,8 @@ class RLPvpAgent:
         gamma: float = 0.95,
         lr: float = 2e-4,
         save_path: str = "models/rl_pvp_model.pth",
+        use_overlay: bool = True,
+        show_cv_hud: bool = False,
     ):
         self.width, self.height = resolution
         self.epsilon = epsilon_start
@@ -192,6 +195,8 @@ class RLPvpAgent:
         self.epsilon_decay = epsilon_decay
         self.gamma = gamma
         self.save_path = save_path
+        self.use_overlay = use_overlay
+        self.show_cv_hud = show_cv_hud
 
         # Hardware & Perception
         self.input_ctrl = InputController()
@@ -238,6 +243,12 @@ class RLPvpAgent:
 
         # Asynchronous background GPU trainer (prevents 40ms blocking spikes in combat loop)
         self.async_trainer = AsyncTrainer(self, batch_size=32, interval_sec=0.05)
+
+        # Desktop PvP Keystrokes & Mousepad Overlay
+        self.overlay: Optional[PvPOverlayClient] = None
+        if self.use_overlay:
+            self.overlay = PvPOverlayClient()
+            self.overlay.start()
 
     @property
     def is_active(self) -> bool:
@@ -401,6 +412,19 @@ class RLPvpAgent:
                     print("[!] Minecraft window closed. Stopping agent.", flush=True)
                     break
 
+                # 0. Check interactive commands from desktop overlay
+                if self.overlay:
+                    for cmd in self.overlay.poll_commands():
+                        action = cmd.get("action")
+                        if action == "set_active":
+                            val = bool(cmd.get("value", False))
+                            self.killswitch.set_active(val)
+                            status_str = "ACTIVE (FIGHTING)" if val else "PAUSED"
+                            print(f"\n[AI STATE TOGGLED VIA OVERLAY: {status_str}]", flush=True)
+                        elif action == "quit":
+                            print("\n[!] Overlay exit clicked. Stopping RL agent...", flush=True)
+                            return
+
                 active = self.is_active
 
                 # 1. Capture screen
@@ -450,41 +474,62 @@ class RLPvpAgent:
                         }
                         self.input_ctrl.release_all()
 
-                    # 8. Render Rich Combat HUD
-                    hud = self.detector.draw_hud(frame, det, action_dict)
-                    state_color = (0, 255, 0) if active else (0, 255, 255)
-                    state_txt = "RL: FIGHTING & LEARNING [F6: Pause | ESC: STOP]" if active else "RL: PAUSED [Press F6 in MC to Start]"
-                    cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2)
-
-                    # Cooldown Charge Meter
-                    charge = reward_data.get("cooldown_charge", 1.0)
-                    bars = int(charge * 10)
-                    meter_str = f"Atk Meter: [{'|' * bars}{'.' * (10 - bars)}] {int(charge * 100)}%"
-                    meter_color = (0, 255, 0) if charge >= 0.85 else (0, 0, 255)
-                    cv2.putText(hud, meter_str, (10, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.48, meter_color, 1)
-
-                    # RL Metrics & Knockback Readiness
-                    kb_ready = reward_data.get("sprint_reset_ready", True)
-                    kb_txt = "KB READY (+40)" if kb_ready else "SWEEP MODE (+10)"
-                    kb_color = (0, 255, 255) if kb_ready else (180, 180, 180)
-                    rl_metric_txt = f"Reward: {reward_data['reward']:+.1f} (Tot: {self.cumulative_reward:.0f}) | {kb_txt} | Loss: {self.last_loss:.3f}"
-                    cv2.putText(hud, rl_metric_txt, (10, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.48, kb_color, 1)
-
-                    if reward_data.get("hit_type") != "none":
-                        ht = reward_data["hit_type"]
-                        hit_color = (
-                            (0, 255, 0) if "knockback" in ht
-                            else ((0, 255, 255) if "critical" in ht
-                            else ((255, 215, 0) if "dist" in ht
-                            else ((0, 0, 255) if "spam" in ht
-                            else ((200, 200, 0) if "sweep" in ht
-                            else (200, 200, 200)))))
+                    # 8. Update Desktop Keystrokes & Mousepad Overlay
+                    if self.overlay:
+                        target_dist = round(550.0 / max(30.0, float(det.get("box_h", 0))), 1) if det["has_target"] else 0.0
+                        self.overlay.update(
+                            active=active,
+                            w=action_dict.get("w", False),
+                            s=action_dict.get("s", False),
+                            a=action_dict.get("a", False),
+                            d=action_dict.get("d", False),
+                            sprint=action_dict.get("sprint", False),
+                            space=action_dict.get("jump", False),
+                            attack=action_dict.get("attack", False),
+                            dx=action_dict.get("dx", 0),
+                            dy=action_dict.get("dy", 0),
+                            target_locked=det["has_target"],
+                            target_dist=target_dist,
+                            cooldown=reward_data.get("cooldown_charge", 1.0),
+                            hit_type=reward_data.get("hit_type", "none"),
                         )
-                        cv2.putText(hud, f"EVENT: {ht.upper()}!", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.65, hit_color, 2)
 
-                    cv2.imshow("Minecraft PvP RL Agent - Live Training HUD (Press 'q' to stop)", hud)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+                    # 9. Render Legacy OpenCV HUD (Optional with --cv-hud)
+                    if self.show_cv_hud:
+                        hud = self.detector.draw_hud(frame, det, action_dict)
+                        state_color = (0, 255, 0) if active else (0, 255, 255)
+                        state_txt = "RL: FIGHTING & LEARNING [F6: Pause | ESC: STOP]" if active else "RL: PAUSED [Press F6 in MC to Start]"
+                        cv2.putText(hud, state_txt, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2)
+
+                        # Cooldown Charge Meter
+                        charge = reward_data.get("cooldown_charge", 1.0)
+                        bars = int(charge * 10)
+                        meter_str = f"Atk Meter: [{'|' * bars}{'.' * (10 - bars)}] {int(charge * 100)}%"
+                        meter_color = (0, 255, 0) if charge >= 0.85 else (0, 0, 255)
+                        cv2.putText(hud, meter_str, (10, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.48, meter_color, 1)
+
+                        # RL Metrics & Knockback Readiness
+                        kb_ready = reward_data.get("sprint_reset_ready", True)
+                        kb_txt = "KB READY (+40)" if kb_ready else "SWEEP MODE (+10)"
+                        kb_color = (0, 255, 255) if kb_ready else (180, 180, 180)
+                        rl_metric_txt = f"Reward: {reward_data['reward']:+.1f} (Tot: {self.cumulative_reward:.0f}) | {kb_txt} | Loss: {self.last_loss:.3f}"
+                        cv2.putText(hud, rl_metric_txt, (10, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.48, kb_color, 1)
+
+                        if reward_data.get("hit_type") != "none":
+                            ht = reward_data["hit_type"]
+                            hit_color = (
+                                (0, 255, 0) if "knockback" in ht
+                                else ((0, 255, 255) if "critical" in ht
+                                else ((255, 215, 0) if "dist" in ht
+                                else ((0, 0, 255) if "spam" in ht
+                                else ((200, 200, 0) if "sweep" in ht
+                                else (200, 200, 200)))))
+                            )
+                            cv2.putText(hud, f"EVENT: {ht.upper()}!", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.65, hit_color, 2)
+
+                        cv2.imshow("Minecraft PvP RL Agent - Live Training HUD (Press 'q' to stop)", hud)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
 
                 next_tick += tick_interval
                 sleep_time = next_tick - time.perf_counter()
@@ -496,6 +541,8 @@ class RLPvpAgent:
         except KeyboardInterrupt:
             print("\n[+] Stop signal received.", flush=True)
         finally:
+            if self.overlay:
+                self.overlay.stop()
             self.async_trainer.stop()
             self.killswitch.stop()
             self.input_ctrl.release_all()
@@ -503,11 +550,17 @@ class RLPvpAgent:
             torch.save(self.q_net.state_dict(), self.save_path)
             print(f"[+] RL Agent weights saved to: {os.path.abspath(self.save_path)}", flush=True)
             self.cap.close()
-            cv2.destroyAllWindows()
+            if self.show_cv_hud:
+                cv2.destroyAllWindows()
 
 
 def main():
-    agent = RLPvpAgent()
+    parser = argparse.ArgumentParser(description="Minecraft RL PvP Agent with Desktop Keystrokes Overlay")
+    parser.add_argument("--cv-hud", action="store_true", help="Display legacy OpenCV HUD debug window")
+    parser.add_argument("--no-overlay", action="store_true", help="Disable the desktop overlay")
+    args = parser.parse_args()
+
+    agent = RLPvpAgent(use_overlay=not args.no_overlay, show_cv_hud=args.cv_hud)
     agent.run()
 
 
