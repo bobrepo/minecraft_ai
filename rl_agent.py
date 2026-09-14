@@ -11,6 +11,7 @@ Features:
 import argparse
 import collections
 import ctypes
+import math
 import os
 import random
 import sys
@@ -165,15 +166,15 @@ class AsyncTrainer:
 class RLPvpAgent:
     """Reinforcement Learning Combat Agent running at 20 TPS."""
 
-    # Discrete Action Mappings
+    # Discrete Action Mappings (Omnidirectional Search Sweeps when target is lost)
     AIM_DELTAS = [
-        (0.0, 0.0),    # 0: None
-        (-60.0, 0.0),  # 1: Fast Left
-        (-18.0, 0.0),  # 2: Soft Left
-        (18.0, 0.0),   # 3: Soft Right
-        (60.0, 0.0),   # 4: Fast Right
-        (0.0, -16.0),  # 5: Soft Up
-        (0.0, 16.0),   # 6: Soft Down
+        (0.0, 0.0),       # 0: Center / None
+        (-35.0, -15.0),   # 1: Diagonal Up-Left
+        (-35.0, 15.0),    # 2: Diagonal Down-Left
+        (35.0, -15.0),    # 3: Diagonal Up-Right
+        (35.0, 15.0),     # 4: Diagonal Down-Right
+        (-55.0, 0.0),     # 5: Fast Horizontal Left
+        (55.0, 0.0),      # 6: Fast Horizontal Right
     ]
 
     def __init__(
@@ -241,6 +242,9 @@ class RLPvpAgent:
         self.step_count = 0
         self.last_loss = 0.0
         self._was_active: bool = False
+        self.prev_dx: float = 0.0
+        self.prev_dy: float = 0.0
+        self.max_aim_delta: float = 120.0
 
         # Asynchronous background GPU trainer (prevents 40ms blocking spikes in combat loop)
         self.async_trainer = AsyncTrainer(self, batch_size=32, interval_sec=0.05)
@@ -270,9 +274,21 @@ class RLPvpAgent:
         # Exploration
         if random.random() < self.epsilon:
             if det["has_target"] and random.random() < 0.65:
-                # 1. Vision-guided aiming heuristic
-                dx = det["dx"]
-                aim_act = 1 if dx < -50 else (2 if dx < -10 else (3 if dx > 10 else (4 if dx > 50 else 0)))
+                # 1. Vision-guided aiming heuristic in full 360 degrees
+                dist = math.hypot(det["dx"], det["dy"])
+                d_dx = abs(det["dx"] - self.prev_dx)
+                d_dy = abs(det["dy"] - self.prev_dy)
+
+                if dist > 60:
+                    aim_act = 1  # Fast snap aim in direction of target
+                elif d_dx > 12 or d_dy > 12:
+                    aim_act = 4  # Predictive lead aim
+                elif dist > 20:
+                    aim_act = 2  # Medium pursuit aim
+                elif dist > 5:
+                    aim_act = 3  # Precision micro-tracking
+                else:
+                    aim_act = 0  # Dead-center hold
 
                 # 2. Movement heuristic with W-Tap sprint reset and distance spacing:
                 target_h = det.get("box_h", 0.0)
@@ -315,12 +331,60 @@ class RLPvpAgent:
             atk_act = int(torch.argmax(atk_q[0]).item())
             return aim_act, move_act, jump_act, atk_act
 
-    def dispatch_action(self, action_tuple: Tuple[int, int, int, int]):
-        """Execute chosen action tuple through DirectInput."""
+    def dispatch_action(self, action_tuple: Tuple[int, int, int, int], det: Optional[Dict] = None):
+        """Execute chosen action tuple through DirectInput with full 360° omnidirectional aiming."""
         aim_act, move_act, jump_act, atk_act = action_tuple
 
-        # 1. Aim
-        dx, dy = self.AIM_DELTAS[aim_act]
+        # 1. Full 360° Omnidirectional Aiming
+        if det and det.get("has_target"):
+            cur_dx = float(det["dx"])
+            cur_dy = float(det["dy"])
+            d_dx = cur_dx - self.prev_dx
+            d_dy = cur_dy - self.prev_dy
+
+            if aim_act == 1:
+                # Fast Snap: rapid target acquisition along true 360° vector
+                ax = (cur_dx * 0.65) + (d_dx * 0.15)
+                ay = (cur_dy * 0.65) + (d_dy * 0.15)
+            elif aim_act == 2:
+                # Medium Pursuit: smooth tracking along true 360° vector
+                ax = (cur_dx * 0.45) + (d_dx * 0.10)
+                ay = (cur_dy * 0.45) + (d_dy * 0.10)
+            elif aim_act == 3:
+                # Precision Tracking: fine micro-adjustments near crosshair
+                ax = cur_dx * 0.28
+                ay = cur_dy * 0.28
+            elif aim_act == 4:
+                # Predictive Lead: leads moving enemy based on velocity
+                ax = (cur_dx * 0.50) + (d_dx * 0.25)
+                ay = (cur_dy * 0.50) + (d_dy * 0.25)
+            elif aim_act == 5:
+                # Rotational search left
+                ax, ay = -45.0, 0.0
+            elif aim_act == 6:
+                # Rotational search right
+                ax, ay = 45.0, 0.0
+            else:
+                # Dead-center lock (micro-deadband)
+                ax, ay = 0.0, 0.0
+
+            # Deadband filter to prevent jitter when crosshair is dead-center
+            if abs(cur_dx) < 3.0:
+                ax = 0.0
+            if abs(cur_dy) < 3.0:
+                ay = 0.0
+
+            dx = float(np.clip(ax, -self.max_aim_delta, self.max_aim_delta))
+            dy = float(np.clip(ay, -self.max_aim_delta * 0.75, self.max_aim_delta * 0.75))
+
+            self.prev_dx = cur_dx
+            self.prev_dy = cur_dy
+        else:
+            # Target not in view: omnidirectional search sweeps (diagonals & horizontals)
+            dx, dy = self.AIM_DELTAS[aim_act]
+            self.prev_dx = 0.0
+            self.prev_dy = 0.0
+
         if dx != 0 or dy != 0:
             self.input_ctrl.move_mouse(int(dx), int(dy))
 
@@ -444,7 +508,7 @@ class RLPvpAgent:
                     # 4. Dispatch action if active
                     if active:
                         self._was_active = True
-                        action_dict = self.dispatch_action(action_tuple)
+                        action_dict = self.dispatch_action(action_tuple, det=det)
                         action_flags = self.reward_engine.record_action(
                             w=action_dict["w"],
                             jump=action_dict["jump"],
