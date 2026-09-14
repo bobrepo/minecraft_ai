@@ -9,3 +9,4 @@ opencv-python
 matplotlib
 mss
 pywin32
+pydirectinput
