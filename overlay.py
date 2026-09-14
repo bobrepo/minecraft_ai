@@ -30,7 +30,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     # Geometry constants
     width = 252
     collapsed_h = 46
-    expanded_h = 476
+    expanded_h = 508
 
     # Initial position: top-left with safe margins
     pos_x = 24
@@ -49,6 +49,8 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         "event_text": "",
         "event_color": "#22c55e",
         "event_timer": 0,
+        "score": 0.0,
+        "reward": 0.0,
     }
 
     # --- Header / Movable Bar ---
@@ -65,6 +67,11 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         header, text="○ OFF", fg="#a1a1aa", bg="#27272a", font=("Segoe UI", 8, "bold")
     )
     status_pill.pack(side=tk.LEFT, padx=4)
+
+    header_score_lbl = tk.Label(
+        header, text="", fg="#fbbf24", bg="#27272a", font=("Segoe UI", 8, "bold")
+    )
+    header_score_lbl.pack(side=tk.LEFT, padx=4)
 
     # Close button (signals agent to stop and quit)
     def on_close_click():
@@ -194,9 +201,9 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     )
     key_space.pack()
 
-    # 2. Combat Sensing & Cooldown Strip
+    # 2. Combat Sensing Strip
     sensing_frame = tk.Frame(content_frame, bg="#27272a", relief=tk.FLAT, bd=0)
-    sensing_frame.pack(fill=tk.X, padx=10, pady=4)
+    sensing_frame.pack(fill=tk.X, padx=10, pady=(4, 2))
 
     target_lbl = tk.Label(
         sensing_frame, text="Target: 🔍 SCANNING", bg="#27272a", fg="#a1a1aa", font=("Segoe UI", 8, "bold")
@@ -207,6 +214,20 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         sensing_frame, text="", bg="#27272a", fg="#22c55e", font=("Segoe UI", 8, "bold")
     )
     event_lbl.pack(side=tk.RIGHT, padx=6, pady=2)
+
+    # 3. RL Points & Reward Banner
+    reward_frame = tk.Frame(content_frame, bg="#27272a", relief=tk.FLAT, bd=0)
+    reward_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+    score_lbl = tk.Label(
+        reward_frame, text="POINTS: 0", bg="#27272a", fg="#fbbf24", font=("Segoe UI", 8, "bold")
+    )
+    score_lbl.pack(side=tk.LEFT, padx=6, pady=2)
+
+    reward_tick_lbl = tk.Label(
+        reward_frame, text="+0.0 pts/tk", bg="#27272a", fg="#22c55e", font=("Segoe UI", 8, "bold")
+    )
+    reward_tick_lbl.pack(side=tk.RIGHT, padx=6, pady=2)
 
     # Weapon Recharge Progress Bar
     cd_canvas = tk.Canvas(content_frame, width=230, height=6, bg="#27272a", highlightthickness=0)
@@ -265,9 +286,12 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         if active:
             status_pill.config(text="● RUNNING", fg="#22c55e")
             action_btn.config(text="⏹ STOP AI", bg="#dc2626", activebackground="#ef4444")
+            sign = "+" if state["score"] > 0 else ""
+            header_score_lbl.config(text=f"[{sign}{state['score']:,.0f} pts]" if state["score"] != 0 else "")
         else:
             status_pill.config(text="○ STOPPED", fg="#a1a1aa")
             action_btn.config(text="▶ RUN AI", bg="#16a34a", activebackground="#22c55e")
+            header_score_lbl.config(text="")
         update_window_expansion()
 
     def set_key_style(widget, is_pressed: bool, active_bg="#10b981", active_fg="#ffffff"):
@@ -357,6 +381,31 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                             else:
                                 state["event_color"] = "#eab308"
 
+                        # RL Rewards & Points Display
+                        r_val = float(msg.get("reward", 0.0))
+                        s_val = float(msg.get("total_score", 0.0))
+                        state["score"] = s_val
+                        state["reward"] = r_val
+
+                        # Format tick reward (pts/tk)
+                        if r_val > 0.0:
+                            r_str = f"+{r_val:.1f} pts/tk"
+                            r_col = "#22c55e"  # emerald green (looking at enemy)
+                        elif r_val < 0.0:
+                            r_str = f"{r_val:.1f} pts/tk"
+                            r_col = "#ef4444"  # red (negative penalty)
+                        else:
+                            r_str = "+0.0 pts/tk"
+                            r_col = "#71717a"
+                        reward_tick_lbl.config(text=r_str, fg=r_col)
+
+                        # Format cumulative score
+                        sign = "+" if s_val > 0 else ""
+                        s_col = "#fbbf24" if s_val >= 0 else "#ef4444"
+                        score_lbl.config(text=f"POINTS: {sign}{s_val:,.0f}", fg=s_col)
+                        if state["active"]:
+                            header_score_lbl.config(text=f"[{sign}{s_val:,.0f} pts]")
+
         except Exception:
             pass
 
@@ -438,6 +487,8 @@ class PvPOverlayClient:
         hit_type: str = "none",
         predicting: bool = False,
         pred_direction: str = "CENTER",
+        reward: float = 0.0,
+        total_score: float = 0.0,
     ):
         """Enqueue state update for overlay rendering (takes <0.005ms)."""
         if not self._is_running:
@@ -461,6 +512,8 @@ class PvPOverlayClient:
             "hit_type": hit_type,
             "predicting": predicting,
             "pred_direction": pred_direction,
+            "reward": float(reward),
+            "total_score": float(total_score),
         }
         try:
             self._data_queue.put_nowait(msg)
@@ -481,7 +534,7 @@ class PvPOverlayClient:
         return commands
 
     def stop(self):
-        """Gracefully shut down the overlay process."""
+        """Cleanly terminate the overlay process and release resources."""
         if not self._is_running:
             return
 
@@ -511,8 +564,11 @@ if __name__ == "__main__":
     client.update(active=True)
     time.sleep(0.5)
 
-    print("Simulating W + Sprint + Mouse Aim Flick + Space...")
+    print("Simulating W + Sprint + Mouse Aim Flick + Space + Reward Points...")
+    sim_score = 0.0
     for i in range(15):
+        cur_reward = 15.0 if i > 3 else -1.0
+        sim_score += cur_reward
         client.update(
             active=True,
             w=True,
@@ -525,6 +581,8 @@ if __name__ == "__main__":
             target_dist=2.8,
             cooldown=0.9,
             hit_type="knockback_hit" if i == 8 else "none",
+            reward=cur_reward,
+            total_score=sim_score,
         )
         time.sleep(0.05)
 

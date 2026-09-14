@@ -587,6 +587,8 @@ class RLPvpAgent:
                             hit_type=reward_data.get("hit_type", "none"),
                             predicting=pred_info.get("is_predicting", False),
                             pred_direction=pred_info.get("direction", "CENTER"),
+                            reward=reward_data.get("reward", 0.0),
+                            total_score=self.cumulative_reward,
                         )
 
                     # 9. Render Legacy OpenCV HUD (Optional with --cv-hud)
