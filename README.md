@@ -4,13 +4,20 @@ This project is in early development and represents the first working piece of a
 ---
 
 ## Gameplay Preview
+<<<<<<< HEAD
 # Version 1:
 <video src="vid/test_horizontal.mp4" controls="controls" width="100%"></video>
 
 [Download or view the demo video](vid/test_horizontal.mp4)
 
 
-#Version 2:
-<video src="vid/updatedv2_hori.mp4" controls="controls" width="100%"></video>
 
-[Download or view the demo video](vid/updatedv2_hori.mp4)
+=======
+`
+
+
+
+
+https://github.com/user-attachments/assets/f5228483-6bf6-4199-bcf3-1607df37c6e4
+
+>>>>>>> 52e8435abf248cc5023550884b6cbb4f426abe50
