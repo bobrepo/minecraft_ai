@@ -6,10 +6,6 @@ This project is in early development and represents the first working piece of a
 ## Gameplay Preview
 
 # Version 1:
-<video src="vid/test_horizontal.mp4" controls="controls" width="100%"></video>
-
-[Download or view the demo video](vid/test_horizontal.mp4)
-
 
 https://github.com/user-attachments/assets/f5228483-6bf6-4199-bcf3-1607df37c6e4
 
