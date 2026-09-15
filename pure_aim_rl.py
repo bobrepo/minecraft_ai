@@ -34,7 +34,7 @@ from overlay import PvPOverlayClient
 class BranchingDuelingQNet(nn.Module):
     """Ultra-fast 2-branch dueling network for simultaneous Yaw & Pitch aim control."""
 
-    def __init__(self, state_dim: int = 10, yaw_dim: int = 9, pitch_dim: int = 7):
+    def __init__(self, state_dim: int = 10, yaw_dim: int = 17, pitch_dim: int = 7):
         super().__init__()
 
         # Shared feature extractor
@@ -167,12 +167,14 @@ class PureAimRLAgent:
         use_overlay: bool = True,
         horizontal_only: bool = True,
         fps: int = 60,
+        eval_mode: bool = False,
     ):
         self.width, self.height = resolution
         self.save_path = save_path
         self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_min = epsilon_min
+        self.eval_mode = eval_mode
+        self.epsilon = 0.0 if eval_mode else epsilon_start
+        self.epsilon_min = 0.0 if eval_mode else epsilon_min
         self.epsilon_decay = epsilon_decay
         self.use_overlay = use_overlay
         self.fps = max(10, min(120, fps))
@@ -194,11 +196,32 @@ class PureAimRLAgent:
 
         if os.path.exists(save_path):
             try:
-                self.q_net.load_state_dict(torch.load(save_path, map_location=self.device))
-                self.target_net.load_state_dict(self.q_net.state_dict())
-                print(f"[+] Loaded existing Aim weights from: {save_path}", flush=True)
+                state_dict = torch.load(save_path, map_location=self.device)
+                # Verify shape compatibility with 17-action yaw head
+                if state_dict.get("yaw_head.2.weight", torch.empty(0)).shape[0] == 17:
+                    self.q_net.load_state_dict(state_dict)
+                    self.target_net.load_state_dict(self.q_net.state_dict())
+                    print(f"[+] Loaded existing 17-action Aim weights from: {save_path}", flush=True)
+                else:
+                    backup_path = save_path.replace(".pth", "_9act_backup.pth")
+                    import shutil
+                    if not os.path.exists(backup_path):
+                        shutil.copyfile(save_path, backup_path)
+                        print(f"[!] Previous 9-action weights safely backed up to: {backup_path}", flush=True)
+                    self._warm_transfer_9act(state_dict)
+                    print(f"[+] Successfully warm-transferred 9-action trained weights into 17-action Q-network!", flush=True)
             except Exception as e:
-                print(f"[!] Could not load weights ({e}), starting fresh.", flush=True)
+                # Attempt recovery from backup if main file was interrupted
+                backup_path = save_path.replace(".pth", "_prev_backup.pth")
+                if os.path.exists(backup_path):
+                    try:
+                        self.q_net.load_state_dict(torch.load(backup_path, map_location=self.device))
+                        self.target_net.load_state_dict(self.q_net.state_dict())
+                        print(f"[+] Successfully recovered weights from backup: {backup_path}", flush=True)
+                    except Exception:
+                        print(f"[!] Could not load backup weights ({e}), starting fresh.", flush=True)
+                else:
+                    print(f"[!] Could not load weights ({e}), starting fresh.", flush=True)
 
         self.optimizer = optim.AdamW(self.q_net.parameters(), lr=lr, weight_decay=1e-4)
         self.loss_fn = nn.SmoothL1Loss()  # Huber loss
@@ -215,6 +238,8 @@ class PureAimRLAgent:
         self.step_count = 0
         self.episodes = 0
         self.last_loss = 0.0
+        self.speed_mode = "auto"
+        self.lost_target_ticks = 0
 
         # Training lock to prevent race conditions
         self.train_lock = threading.Lock()
@@ -228,53 +253,160 @@ class PureAimRLAgent:
         # Asynchronous background GPU trainer (decouples backprop from 60 FPS loop)
         self.async_trainer = AsyncAimTrainer(self, batch_size=64, interval_sec=0.05)
 
+        # Directional search memory (1 = Right, -1 = Left) when target moves off-screen
+        self.last_seen_dir = 1
+
+    def _warm_transfer_9act(self, d9: Dict[str, torch.Tensor]):
+        """Warm-transfer weights from 9-action model into 17-action network."""
+        curr = self.q_net.state_dict()
+        for k in curr.keys():
+            if "yaw_head.2." not in k and k in d9 and d9[k].shape == curr[k].shape:
+                curr[k] = d9[k]
+
+        w9 = d9["yaw_head.2.weight"]
+        b9 = d9["yaw_head.2.bias"]
+        w17 = curr["yaw_head.2.weight"].clone()
+        b17 = curr["yaw_head.2.bias"].clone()
+
+        # Map 9 yaw actions to their exact corresponding indices in 17 actions
+        mapping = {0: 3, 1: 4, 2: 5, 3: 6, 4: 8, 5: 10, 6: 11, 7: 12, 8: 13}
+        for i9, i17 in mapping.items():
+            w17[i17] = w9[i9]
+            b17[i17] = b9[i9]
+
+        # Fast and micro actions
+        w17[0] = w17[1] = w17[2] = w9[0]
+        b17[0] = b17[1] = b17[2] = b9[0]
+        w17[7] = (w9[3] + w9[4]) * 0.5
+        b17[7] = (b9[3] + b9[4]) * 0.5
+        w17[9] = (w9[5] + w9[4]) * 0.5
+        b17[9] = (b9[5] + b9[4]) * 0.5
+        w17[14] = w17[15] = w17[16] = w9[8]
+        b17[14] = b17[15] = b17[16] = b9[8]
+
+        curr["yaw_head.2.weight"] = w17
+        curr["yaw_head.2.bias"] = b17
+        self.q_net.load_state_dict(curr)
+        self.target_net.load_state_dict(curr)
+
+    def save_checkpoint(self, path: Optional[str] = None):
+        """Safely save model weights with backup preservation to prevent data loss or corruption."""
+        target_path = path or self.save_path
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+        # 1. Rolling backup of previous checkpoint if it exists
+        if os.path.exists(target_path):
+            backup_path = target_path.replace(".pth", "_prev_backup.pth")
+            try:
+                import shutil
+                shutil.copyfile(target_path, backup_path)
+            except Exception:
+                pass
+
+        # 2. Atomic write: write to .tmp then replace
+        tmp_path = target_path + ".tmp"
+        with self.train_lock:
+            torch.save(self.q_net.state_dict(), tmp_path)
+        if os.path.exists(target_path):
+            os.replace(tmp_path, target_path)
+        else:
+            os.rename(tmp_path, target_path)
+
     @property
     def is_active(self) -> bool:
         return self.killswitch.is_active
 
     def select_action(self, state: np.ndarray, det: Dict) -> Tuple[int, int]:
-        """Epsilon-greedy action selection with guided exploration."""
-        if random.random() < self.epsilon:
-            if det["has_target"] and random.random() < 0.60:
-                # Guided Exploration: choose direction towards target
-                dx = det["dx"]
-                dy = det["dy"]
-                # Yaw heuristic
-                if dx < -25:
-                    yaw_act = random.choice([0, 1])  # Fast Left
-                elif dx < -6:
-                    yaw_act = random.choice([1, 2])  # Med Left
-                elif dx < -2:
-                    yaw_act = 3  # Micro Left
-                elif dx > 25:
-                    yaw_act = random.choice([7, 8])  # Fast Right
-                elif dx > 6:
-                    yaw_act = random.choice([6, 7])  # Med Right
-                elif dx > 2:
-                    yaw_act = 5  # Micro Right
-                else:
-                    yaw_act = 4  # Center / Hold
-
-                # Pitch heuristic
-                if dy < -15:
-                    pitch_act = 0  # Fast Up
-                elif dy < -3:
-                    pitch_act = 1  # Med Up
-                elif dy > 15:
-                    pitch_act = 6  # Fast Down
-                elif dy > 3:
-                    pitch_act = 5  # Med Down
-                else:
-                    pitch_act = 3  # Center / Hold
-
-                if self.env.horizontal_only:
-                    pitch_act = 3
-                return yaw_act, pitch_act
+        """Target-sticky action selection with 180° Backflip and Left-to-Right scanning."""
+        # 1. When no target is visible: execute 180° Backflip, then scan Left <-> Right
+        if not det.get("has_target", False):
+            self.lost_target_ticks += 1
+            # Ticks 1..4: rapid 180° flick burst (4 ticks * 160px = 640px ≈ 180°) in last seen direction
+            if self.lost_target_ticks <= 4:
+                yaw_act = 16 if self.last_seen_dir >= 0 else 0
+                return (yaw_act, 3)
+            # Ticks 5..18: hold steady to let camera settle and acquire target behind
+            elif self.lost_target_ticks <= 18:
+                return (8, 3)
+            # Ticks 19+: smooth Left <-> Right back-and-forth scanning sweep
             else:
-                pitch_act = 3 if self.env.horizontal_only else random.randint(0, 6)
-                return (random.randint(0, 8), pitch_act)
+                cycle = ((self.lost_target_ticks - 19) // 24) % 2
+                dir_mult = self.last_seen_dir if cycle == 0 else -self.last_seen_dir
+                yaw_act = 11 if dir_mult >= 0 else 5
+                return (yaw_act, 3)
 
-        # Exploitation via Q-Network
+        # Target is visible: reset off-screen counter and update last seen direction
+        self.lost_target_ticks = 0
+        dx = det.get("dx", 0.0)
+        if dx < -6.0:
+            self.last_seen_dir = -1  # Enemy is on the left
+        elif dx > 6.0:
+            self.last_seen_dir = 1   # Enemy is on the right
+
+        # 2. Sticky Target Lock: Hitbox center deadzone & velocity feedforward matching
+        # Fix: Lock only when centered within deadzone, allowing full left-to-right glide
+        is_locked = abs(dx) <= 4.5
+        if is_locked:
+            target_vx = float(det.get("vx", 0.0))
+            if abs(target_vx) > 2.0:
+                # Find closest discrete yaw action gear to match target lateral velocity
+                best_idx = min(range(len(self.env.YAW_ACTIONS)), key=lambda i: abs(self.env.YAW_ACTIONS[i] - target_vx))
+                return (best_idx, 3)
+            return (8, 3)  # Hold 0.0 delta (Center / Steady Hold)
+
+        # 3. Target is in view and off-center: Epsilon-greedy exploration across 17 gears
+        if random.random() < self.epsilon:
+            dx = det.get("dx", 0.0)
+            dy = det.get("dy", 0.0)
+            # Multi-tier granular decision spectrum (8 gears in each direction)
+            if dx < -200:
+                yaw_act = random.choice([0, 1])    # Hyper / Super Left (-160, -110)
+            elif dx < -120:
+                yaw_act = random.choice([1, 2])    # Super / Fast Left (-110, -75)
+            elif dx < -60:
+                yaw_act = random.choice([2, 3])    # Fast / Med-Fast Left (-75, -50)
+            elif dx < -30:
+                yaw_act = random.choice([3, 4])    # Med-Fast / Med Left (-50, -32)
+            elif dx < -14:
+                yaw_act = random.choice([4, 5])    # Med / Med-Slow Left (-32, -18)
+            elif dx < -6:
+                yaw_act = random.choice([5, 6])    # Med-Slow / Slow Left (-18, -8)
+            elif dx < -2:
+                yaw_act = 7                        # Micro Left (-3)
+            elif dx > 200:
+                yaw_act = random.choice([15, 16])  # Super / Hyper Right (+110, +160)
+            elif dx > 120:
+                yaw_act = random.choice([14, 15])  # Fast / Super Right (+75, +110)
+            elif dx > 60:
+                yaw_act = random.choice([13, 14])  # Med-Fast / Fast Right (+50, +75)
+            elif dx > 30:
+                yaw_act = random.choice([12, 13])  # Med / Med-Fast Right (+32, +50)
+            elif dx > 14:
+                yaw_act = random.choice([11, 12])  # Med-Slow / Med Right (+18, +32)
+            elif dx > 6:
+                yaw_act = random.choice([10, 11])  # Slow / Med-Slow Right (+8, +18)
+            elif dx > 2:
+                yaw_act = 9                        # Micro Right (+3)
+            else:
+                yaw_act = 8                        # Center / Hold (0.0)
+
+            # Pitch heuristic
+            if dy < -15:
+                pitch_act = 0  # Fast Up
+            elif dy < -3:
+                pitch_act = 1  # Med Up
+            elif dy > 15:
+                pitch_act = 6  # Fast Down
+            elif dy > 3:
+                pitch_act = 5  # Med Down
+            else:
+                pitch_act = 3  # Center / Hold
+
+            if self.env.horizontal_only:
+                pitch_act = 3
+            return yaw_act, pitch_act
+
+        # 4. Exploitation via Q-Network
         with torch.no_grad():
             state_t = torch.from_numpy(state).unsqueeze(0).to(self.device)
             yaw_q, pitch_q = self.q_net(state_t)
@@ -340,7 +472,9 @@ class PureAimRLAgent:
         print("    [ESC]   : INSTANT STOP", flush=True)
         print("    [Ctrl+C]: Stop Agent and Save Weights", flush=True)
         print("=" * 65, flush=True)
-        print("  Aim Mode: HORIZONTAL ONLY (Yaw Gliding)", flush=True)
+        print("  Aim Mode:        HORIZONTAL ONLY (Yaw Gliding)", flush=True)
+        print("  Target Cues:     Yellow (#FFF500) Body", flush=True)
+        print("  Search Mode:     180° BACKFLIP on target escape + Smooth Left <-> Right Scan", flush=True)
         print("[!] Press F6 in Minecraft to START Pure Aim Training!\n", flush=True)
 
         self.async_trainer.start()
@@ -374,6 +508,20 @@ class PureAimRLAgent:
                         if cmd.get("action") == "set_active":
                             val = bool(cmd.get("value", False))
                             self.killswitch.set_active(val)
+                            if not val:
+                                self.env.input_ctrl.stop_aim()
+                                self.env.input_ctrl.release_all(force=True)
+                        elif cmd.get("action") == "stop_aim":
+                            self.killswitch.set_active(False)
+                            self.env.input_ctrl.stop_aim()
+                            self.env.input_ctrl.release_all(force=True)
+                        elif cmd.get("action") == "set_speed_mode":
+                            new_mode = str(cmd.get("mode", "auto")).lower()
+                            if new_mode in ("auto", "0.5x", "1.0x", "1.5x", "2.0x"):
+                                self.speed_mode = new_mode
+                                mult_map = {"auto": 1.0, "0.5x": 0.5, "1.0x": 1.0, "1.5x": 1.5, "2.0x": 2.0}
+                                self.env.speed_multiplier = mult_map[new_mode]
+                                print(f"[+] RL Aim Speed Mode set to: {self.speed_mode.upper()} ({self.env.speed_multiplier}x)", flush=True)
                         elif cmd.get("action") == "quit":
                             return
 
@@ -402,16 +550,16 @@ class PureAimRLAgent:
                     if self.step_count % 180 == 0:
                         self.target_net.load_state_dict(self.q_net.state_dict())
 
-                    # Periodic auto-save every 1000 steps (~16 seconds at 60 FPS)
+                    # Periodic safe auto-save every 1000 steps (~16 seconds at 60 FPS)
                     if self.step_count % 1000 == 0:
-                        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-                        torch.save(self.q_net.state_dict(), self.save_path)
+                        self.save_checkpoint(self.save_path)
 
-                    yaw_delta = self.env.YAW_ACTIONS[yaw_idx]
+                    yaw_delta = self.env.YAW_ACTIONS[yaw_idx] * self.env.speed_multiplier
                     pitch_delta = 0.0
                     det_info = current_det
                 else:
                     if _was_active:
+                        self.env.input_ctrl.stop_aim()
                         self.env.input_ctrl.release_all(force=True)
                         _was_active = False
                     reward = 0.0
@@ -431,6 +579,7 @@ class PureAimRLAgent:
                         total_score=float(self.cumulative_reward),
                         tps=current_tps,
                         phase="AIM:HORIZ",
+                        speed_mode=self.speed_mode,
                     )
 
                 # Strict 60 FPS hybrid timing
@@ -450,10 +599,10 @@ class PureAimRLAgent:
             if self.overlay:
                 self.overlay.stop()
             self.killswitch.stop()
+            self.env.input_ctrl.stop_aim()
             self.env.close()
-            os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-            torch.save(self.q_net.state_dict(), self.save_path)
-            print(f"[+] Pure Aim RL weights saved to: {os.path.abspath(self.save_path)}", flush=True)
+            self.save_checkpoint(self.save_path)
+            print(f"[+] Pure Aim RL weights safely preserved & saved to: {os.path.abspath(self.save_path)}", flush=True)
 
 
 def main():
@@ -461,6 +610,7 @@ def main():
     parser.add_argument("-w", "--window", type=str, default=None, help="Target window title / HWND")
     parser.add_argument("--no-overlay", action="store_true", help="Disable desktop keystroke overlay")
     parser.add_argument("--fps", type=int, default=60, help="RL loop update rate in FPS (default: 60)")
+    parser.add_argument("--play", "--eval", action="store_true", help="Play mode: zero exploration (epsilon=0) for pure high-performance match play")
     args = parser.parse_args()
 
     agent = PureAimRLAgent(
@@ -468,6 +618,7 @@ def main():
         use_overlay=not args.no_overlay,
         horizontal_only=True,
         fps=args.fps,
+        eval_mode=args.play,
     )
     agent.run()
 

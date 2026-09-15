@@ -97,7 +97,7 @@ class SubTickMouseThread(threading.Thread):
         self.active = False
         self.total_dx = 0.0
         self.total_dy = 0.0
-        self.duration = 0.045
+        self.duration = 0.018
         self.start_time = 0.0
         self.prev_p = 0.0
         self.accum_x = 0.0
@@ -109,7 +109,7 @@ class SubTickMouseThread(threading.Thread):
         """Flash & Hogan Minimum-Jerk position polynomial: 10s^3 - 15s^4 + 6s^5."""
         return 10.0 * (s**3) - 15.0 * (s**4) + 6.0 * (s**5)
 
-    def submit_aim(self, dx: float, dy: float, duration_sec: float = 0.045):
+    def submit_aim(self, dx: float, dy: float, duration_sec: float = 0.018):
         """Submit new aim delta to be dispatched over duration_sec via minimum jerk."""
         with self.lock:
             # If an existing trajectory was active, blend any residual fractional pixels
@@ -149,8 +149,19 @@ class SubTickMouseThread(threading.Thread):
                         self.active = False
             time.sleep(0.007)  # ~140 Hz sub-tick update interval
 
+    def halt(self):
+        """Immediately abort any active mouse trajectory and clear accumulators."""
+        with self.lock:
+            self.active = False
+            self.total_dx = 0.0
+            self.total_dy = 0.0
+            self.accum_x = 0.0
+            self.accum_y = 0.0
+            self.prev_p = 0.0
+
     def stop(self):
         self.running = False
+        self.halt()
 
 
 class InputController:
@@ -159,9 +170,19 @@ class InputController:
     def __init__(self):
         self._pressed_keys: Set[str] = set()
         self._mouse_down: bool = False
+        # Direct Lockstep Accumulators (for zero phase lag 1:1 hardware dispatch)
+        self._direct_accum_x = 0.0
+        self._direct_accum_y = 0.0
         # Minimum-Jerk Sub-Tick Thread running at ~140 Hz
         self.mouse_thread = SubTickMouseThread(self._send_mouse_raw)
         self.mouse_thread.start()
+
+    def stop_aim(self):
+        """Instantly freeze all mouse camera motion in both direct and sub-tick dispatches."""
+        self._direct_accum_x = 0.0
+        self._direct_accum_y = 0.0
+        if hasattr(self, "mouse_thread") and self.mouse_thread.is_alive():
+            self.mouse_thread.halt()
 
     def press_key(self, key: str):
         """Send keydown event with hardware scan code."""
@@ -237,11 +258,35 @@ class InputController:
         x = Input(ctypes.c_ulong(INPUT_MOUSE), ii_)
         ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
 
-    def move_mouse(self, dx: float | int, dy: float | int, dynamic: bool = True):
-        """Rotate first-person 3D camera with biological Minimum-Jerk sub-tick smoothing.
+    def move_mouse_direct(self, dx: float | int, dy: float | int):
+        """Zero-latency 1:1 hardware dispatch with fractional Bresenham pixel conservation.
 
-        Dispatches mouse deltas smoothly across monitor frames via a 140 Hz background
-        thread to eliminate camera tearing, skipping, and jitter in Minecraft.
+        Eliminates phase lag / transport delay between vision detection and mouse action,
+        preventing closed-loop hunting, overshoot, and cursor bobbing.
+        """
+        dx_val = float(dx)
+        dy_val = float(dy)
+        if dx_val == 0.0 and dy_val == 0.0:
+            return
+
+        dy_val = max(-65.0, min(65.0, dy_val))
+
+        self._direct_accum_x += dx_val
+        self._direct_accum_y += dy_val
+
+        sx = int(round(self._direct_accum_x))
+        sy = int(round(self._direct_accum_y))
+        self._direct_accum_x -= sx
+        self._direct_accum_y -= sy
+
+        if sx != 0 or sy != 0:
+            self._send_mouse_raw(sx, sy)
+
+    def move_mouse(self, dx: float | int, dy: float | int, dynamic: bool = False, duration_sec: float = 0.018):
+        """Rotate first-person 3D camera.
+
+        If dynamic is True, dispatches through minimum-jerk sub-tick thread.
+        If dynamic is False (default for zero phase lag lockstep), dispatches directly without delay.
         """
         dx_val = float(dx)
         dy_val = float(dy)
@@ -252,10 +297,10 @@ class InputController:
         dy_val = max(-65.0, min(65.0, dy_val))
 
         if dynamic and hasattr(self, "mouse_thread") and self.mouse_thread.is_alive():
-            # Submit to Minimum-Jerk Sub-Tick Thread (duration 45ms matches 50ms combat tick)
-            self.mouse_thread.submit_aim(dx_val, dy_val, duration_sec=0.045)
+            # Submit to Minimum-Jerk Sub-Tick Thread
+            self.mouse_thread.submit_aim(dx_val, dy_val, duration_sec=duration_sec)
         else:
-            self._send_mouse_raw(int(round(dx_val)), int(round(dy_val)))
+            self.move_mouse_direct(dx_val, dy_val)
 
     def left_down(self):
         """Press left mouse button (punch/attack start)."""
@@ -318,9 +363,8 @@ class InputController:
         elif force:
             self._mouse_down = False
 
-        if hasattr(self, "mouse_thread"):
-            with self.mouse_thread.lock:
-                self.mouse_thread.active = False
+        # 3. Mouse aim motion release: instantly zero sub-tick thread motion
+        self.stop_aim()
 
 
 class EmergencyKillswitchListener:
@@ -347,23 +391,28 @@ class EmergencyKillswitchListener:
         prev = self.is_active
         self.is_active = active
         if prev and not active:
+            self.input_ctrl.stop_aim()
             self.input_ctrl.release_all(force=True)
 
     def _monitor_loop(self):
         VK_F6 = 0x75
+        VK_F7 = 0x76
         VK_ESCAPE = 0x1B
         f6_prev = False
+        f7_prev = False
         esc_prev = False
 
         while self._running:
             try:
                 f6_down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F6) & 0x8000)
+                f7_down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F7) & 0x8000)
                 esc_down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
 
                 # ESC: Instant Emergency Kill / Pause
                 if esc_down and not esc_prev:
                     if self.is_active:
                         self.is_active = False
+                        self.input_ctrl.stop_aim()
                         self.input_ctrl.release_all(force=True)
                         try:
                             winsound.Beep(550, 160)
@@ -373,10 +422,11 @@ class EmergencyKillswitchListener:
                         if self.on_state_change:
                             self.on_state_change(False)
 
-                # F6: Toggle Active / Paused
+                # F6: Toggle Active (Training Mode with Perturbations)
                 elif f6_down and not f6_prev:
                     self.is_active = not self.is_active
                     if not self.is_active:
+                        self.input_ctrl.stop_aim()
                         self.input_ctrl.release_all(force=True)
                     try:
                         if self.is_active:
@@ -385,12 +435,31 @@ class EmergencyKillswitchListener:
                             winsound.Beep(600, 140)
                     except Exception:
                         pass
-                    status = ">>> ACTIVE (FIGHTING) <<<" if self.is_active else "PAUSED"
+                    status = ">>> ACTIVE (F6 TRAINING MODE) <<<" if self.is_active else "PAUSED"
                     print(f"\n[AI STATE TOGGLE (F6): {status}]", flush=True)
                     if self.on_state_change:
                         self.on_state_change(self.is_active)
 
+                # F7: Toggle Active (Clean Match Mode without Perturbations)
+                elif f7_down and not f7_prev:
+                    self.is_active = not self.is_active
+                    if not self.is_active:
+                        self.input_ctrl.stop_aim()
+                        self.input_ctrl.release_all(force=True)
+                    try:
+                        if self.is_active:
+                            winsound.Beep(1400, 100)
+                        else:
+                            winsound.Beep(600, 140)
+                    except Exception:
+                        pass
+                    status = ">>> ACTIVE (F7 CLEAN MATCH MODE) <<<" if self.is_active else "PAUSED"
+                    print(f"\n[AI STATE TOGGLE (F7): {status}]", flush=True)
+                    if self.on_state_change:
+                        self.on_state_change(self.is_active)
+
                 f6_prev = f6_down
+                f7_prev = f7_down
                 esc_prev = esc_down
             except Exception:
                 pass

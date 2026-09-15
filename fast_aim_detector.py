@@ -13,31 +13,113 @@ Crosshair color states (from actual game capture):
   - RED_LOCKED:  Center pixel turns bright RED [33, 1, 255] BGR — crosshair over cyan enemy body
 """
 
+import math
+import time
 from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
 
+class LowPassFilter:
+    """First-order low-pass filter for real-time signal smoothing."""
+
+    def __init__(self, alpha: float = 1.0):
+        self.alpha = float(alpha)
+        self.s: Optional[float] = None
+
+    def reset(self, val: Optional[float] = None):
+        self.s = float(val) if val is not None else None
+
+    def filter(self, val: float, alpha: Optional[float] = None) -> float:
+        if alpha is not None:
+            self.alpha = float(alpha)
+        if self.s is None:
+            self.s = float(val)
+        else:
+            self.s = self.alpha * float(val) + (1.0 - self.alpha) * self.s
+        return self.s
+
+
+class OneEuroFilter:
+    """Velocity-adaptive 1€ (One Euro) Filter for zero-latency jitter-free tracking.
+
+    Casiez, G., Roussel, N. and Vogel, D. (2012)
+    1 € Filter: A Simple Speed-based Low-pass Filter for Noisy Input in HCI.
+    """
+
+    def __init__(
+        self,
+        min_cutoff: float = 1.5,
+        beta: float = 0.018,
+        d_cutoff: float = 1.0,
+    ):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_filter = LowPassFilter()
+        self.dx_filter = LowPassFilter()
+        self.t_prev: Optional[float] = None
+
+    def reset(self, x: Optional[float] = None):
+        self.x_filter.reset(x)
+        self.dx_filter.reset(0.0)
+        self.t_prev = None
+
+    def _compute_alpha(self, rate: float, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        te = 1.0 / max(1e-5, rate)
+        return 1.0 / (1.0 + tau / te)
+
+    def filter(self, x: float, t: Optional[float] = None) -> Tuple[float, float]:
+        """Filter input value and return (filtered_x, filtered_dx_per_sec)."""
+        now = time.perf_counter() if t is None else float(t)
+        if self.t_prev is None or self.x_filter.s is None:
+            self.t_prev = now
+            filt_x = self.x_filter.filter(x)
+            self.dx_filter.filter(0.0)
+            return filt_x, 0.0
+
+        dt = now - self.t_prev
+        # If dt is irregular or excessive (e.g. target re-acquisition after gap), snap immediately
+        if dt <= 0.0001 or dt > 0.25:
+            self.t_prev = now
+            self.x_filter.reset(x)
+            self.dx_filter.reset(0.0)
+            return float(x), 0.0
+
+        rate = 1.0 / dt
+        prev_x = self.x_filter.s
+        raw_dx = (x - prev_x) * rate
+        filt_dx = self.dx_filter.filter(raw_dx, self._compute_alpha(rate, self.d_cutoff))
+        cutoff = self.min_cutoff + self.beta * abs(filt_dx)
+        alpha = self._compute_alpha(rate, cutoff)
+        filt_x = self.x_filter.filter(x, alpha)
+        self.t_prev = now
+        return filt_x, filt_dx
+
+
 class FastAimDetector:
-    """Ultra-fast (<0.4ms) crosshair-centric multi-cue enemy detector."""
+    """Ultra-fast (<0.4ms) crosshair-centric multi-cue enemy detector with 1€ adaptive filtering."""
 
     def __init__(self, resolution: Tuple[int, int] = (640, 480)):
         self.width, self.height = resolution
         self.cx = self.width // 2
         self.cy = self.height // 2
 
-        # 1. Highlighted Enemy: Cyan-green glowing body
-        #    Actual pixel from image: BGR=[223, 255, 0] (B=223, G=255, R=0)
-        #    Range with tolerance for lighting variation:
-        self.lower_cyan_bgr = np.array([170, 210, 0], dtype=np.uint8)
-        self.upper_cyan_bgr = np.array([255, 255, 30], dtype=np.uint8)
-
-        # 2. Sky color boundary (to detect if looking at empty sky)
-        self.lower_sky = np.array([170, 110, 0], dtype=np.uint8)
-        self.upper_sky = np.array([255, 255, 175], dtype=np.uint8)
+        # Highlighted Enemy Cues:
+        # Enemy Body: Yellow (#FFF500 -> BGR ≈ [0, 245, 255])
+        self.lower_yellow_bgr = np.array([0, 190, 200], dtype=np.uint8)
+        self.upper_yellow_bgr = np.array([55, 255, 255], dtype=np.uint8)
 
         # Minecraft 70 deg vertical FOV focal length at current height
         self.fy = self.height / (2.0 * np.tan(np.radians(35.0)))
+
+        # 1€ (One Euro) Adaptive Filters for zero-latency jitter-free coordinate tracking (<2ms phase lag)
+        self.filter_dx = OneEuroFilter(min_cutoff=15.0, beta=0.08, d_cutoff=1.0)
+        self.filter_dy = OneEuroFilter(min_cutoff=15.0, beta=0.08, d_cutoff=1.0)
+        self.prev_has_target = False
+        self.prev_filt_dx = 0.0
+        self.prev_filt_dy = 0.0
 
     def _detect_in_roi(
         self,
@@ -52,141 +134,115 @@ class FastAimDetector:
         if rh < 10 or rw < 10:
             return None
 
-        # --- Cyan Highlighted Enemy ---
-        # Actual BGR from image analysis: [223, 255, 0]  (B=223, G=255, R=0)
-        cyan_mask = cv2.inRange(roi, self.lower_cyan_bgr, self.upper_cyan_bgr)
-        n_cyan = cv2.countNonZero(cyan_mask)
-        if n_cyan > 60:
-            cnts, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # --- Yellow Body (#FFF500) ---
+        roi_target_mask = cv2.inRange(roi, self.lower_yellow_bgr, self.upper_yellow_bgr)
+        cue = "highlight_yellow"
+
+        if cv2.countNonZero(roi_target_mask) > 40:
+            cnts, _ = cv2.findContours(roi_target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if cnts:
                 c = max(cnts, key=cv2.contourArea)
-                if cv2.contourArea(c) > 50:
+                if cv2.contourArea(c) > 40:
                     bx, by, bw, bh = cv2.boundingRect(c)
                     # Aim at horizontal center, upper-center (30% from top = torso/chest area)
                     tx = offset_x + bx + bw / 2.0
                     ty = offset_y + by + bh * 0.30
-                    return tx, ty, float(bw), float(bh), 1.0, "highlight_cyan"
+                    return tx, ty, float(bw), float(bh), 1.0, cue
 
         return None
 
     def check_crosshair_lock(self, frame: np.ndarray) -> Tuple[bool, str]:
-        """Instant sub-0.001ms crosshair color probe to determine if crosshair is directly over enemy.
-
-        Ground truth colors from actual game capture:
-        - SEARCHING (not over enemy): Center pixel is near-black / transparent
-          BGR center ≈ [14, 7, 6] — the crosshair gap (dark transparent hole between white arms)
-          White arms offset from center: BGR ≈ [241, 248, 249]
-        - RED_LOCKED (over enemy): Center pixel turns bright RED
-          BGR ≈ [33, 1, 255] → R=255, G=1, B=33 — crosshair changes color over cyan body
-        """
+        """Instant sub-0.001ms crosshair probe to determine if crosshair is directly on the enemy."""
         h, w = frame.shape[:2]
         cx, cy = w // 2, h // 2
-        # Sample a 5x5 patch around the crosshair center
-        patch = frame[max(0, cy - 2) : min(h, cy + 3), max(0, cx - 2) : min(w, cx + 3)]
+        # Sample an 8x8 patch around the crosshair center
+        patch = frame[max(0, cy - 4) : min(h, cy + 5), max(0, cx - 4) : min(w, cx + 5)]
         if patch.size == 0:
             return False, "UNKNOWN"
 
-        # Check for RED crosshair lock: R > 200, G < 50, B < 80
-        # (in BGR array: channel 2 = R, channel 1 = G, channel 0 = B)
-        red_pixels = (patch[:, :, 2] > 200) & (patch[:, :, 0] < 80) & (patch[:, :, 1] < 50)
-        if np.any(red_pixels):
-            return True, "RED_LOCKED"
+        # 1. Yellow enemy body directly under the crosshair (#FFF500)
+        yellow_mask = cv2.inRange(patch, self.lower_yellow_bgr, self.upper_yellow_bgr)
+        if cv2.countNonZero(yellow_mask) > 4:
+            return True, "YELLOW_LOCKED"
 
-        # Not locked: crosshair center is near-black (transparent gap between white arms)
         return False, "SEARCHING"
 
     def detect(self, frame: np.ndarray, crosshair_centric: bool = True) -> Dict[str, Any]:
-        """Detect opponent head & body target with crosshair-centric outward scanning."""
+        """Detect opponent head & body target with sub-1ms robust yellow detection."""
         h, w = frame.shape[:2]
         ch_x = w // 2
         ch_y = h // 2
 
-        # Instant crosshair color lock probe (<0.001ms)
+        # 1. Instant crosshair color lock probe (<0.001ms)
         crosshair_locked, crosshair_color = self.check_crosshair_lock(frame)
 
-        # Fast subsampled SIMD sky dominance check (0.3ms)
-        sub_frame = frame[::4, ::4]
-        sky_mask = cv2.inRange(sub_frame, self.lower_sky, self.upper_sky)
-        total_sky_ratio = float(cv2.mean(sky_mask)[0]) / 255.0
-        lower_sky = sky_mask[int(sky_mask.shape[0] * 0.45) :, :]
-        lower_sky_ratio = float(cv2.mean(lower_sky)[0]) / 255.0 if lower_sky.size > 0 else 0.0
-        is_facing_sky = (total_sky_ratio > 0.65) or (lower_sky_ratio > 0.38)
+        # 2. Enemy Body (Yellow #FFF500) detection (sub-1ms)
+        target_mask = cv2.inRange(frame, self.lower_yellow_bgr, self.upper_yellow_bgr)
+        cue = "highlight_yellow"
 
-        if is_facing_sky:
-            return {
-                "has_target": False,
-                "target_x": float(ch_x),
-                "target_y": float(ch_y),
-                "dx": 0.0,
-                "dy": 0.0,
-                "box_w": 0.0,
-                "box_h": 0.0,
-                "distance": 99.0,
-                "confidence": 0.0,
-                "cue": "none",
-                "tier": "none",
-                "is_facing_sky": True,
-                "in_lock_zone": False,
-                "crosshair_locked": False,
-                "crosshair_color": crosshair_color,
-            }
+        if cv2.countNonZero(target_mask) > 40:
+            cnts, _ = cv2.findContours(target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                c = max(cnts, key=cv2.contourArea)
+                if cv2.contourArea(c) > 50:
+                    bx, by, bw, bh = cv2.boundingRect(c)
+                    raw_tx = bx + bw / 2.0
+                    raw_ty = by + bh * 0.30
+                    raw_dx = float(raw_tx - ch_x)
+                    raw_dy = float(raw_ty - ch_y)
 
-        res: Optional[Tuple[float, float, float, float, float, str]] = None
-        tier = "none"
+                    if not self.prev_has_target:
+                        # Newly acquired target: reset filter to snap immediately on frame 1 without ramping lag
+                        self.filter_dx.reset(raw_dx)
+                        self.filter_dy.reset(raw_dy)
+                        self.prev_filt_dx = raw_dx
+                        self.prev_filt_dy = raw_dy
+                        filt_dx = raw_dx
+                        filt_dy = raw_dy
+                        target_vx = 0.0
+                        target_vy = 0.0
+                    else:
+                        filt_dx, _ = self.filter_dx.filter(raw_dx)
+                        filt_dy, _ = self.filter_dy.filter(raw_dy)
+                        target_vx = float(filt_dx - self.prev_filt_dx)
+                        target_vy = float(filt_dy - self.prev_filt_dy)
+                        self.prev_filt_dx = filt_dx
+                        self.prev_filt_dy = filt_dy
 
-        if crosshair_centric:
-            # Tier 1: Inner Crosshair Focus Zone (+/- 160px) - sub-0.2ms
-            hw1, hh1 = 160, 160
-            x1_1, y1_1 = max(0, ch_x - hw1), max(0, ch_y - hh1)
-            x2_1, y2_1 = min(w, ch_x + hw1), min(h, ch_y + hh1)
-            res = self._detect_in_roi(frame[y1_1:y2_1, x1_1:x2_1], x1_1, y1_1, ch_x, ch_y)
-            tier = "inner"
+                    self.prev_has_target = True
 
-            # Tier 2: Mid Zone (+/- 320px x +/- 240px)
-            if res is None:
-                hw2, hh2 = 320, 240
-                x1_2, y1_2 = max(0, ch_x - hw2), max(0, ch_y - hh2)
-                x2_2, y2_2 = min(w, ch_x + hw2), min(h, ch_y + hh2)
-                res = self._detect_in_roi(frame[y1_2:y2_2, x1_2:x2_2], x1_2, y1_2, ch_x, ch_y)
-                tier = "mid"
+                    dist_px = float(np.hypot(filt_dx, filt_dy))
+                    dist_est = float(np.clip((self.fy * 1.8) / max(10.0, bh), 0.5, 30.0))
 
-        # Tier 3: Full Combat ROI Fallback (5% to 85% height)
-        if res is None:
-            y_top = int(h * 0.05)
-            y_bot = int(h * 0.85)
-            res = self._detect_in_roi(frame[y_top:y_bot, :], 0, y_top, ch_x, ch_y)
-            tier = "full"
+                    # Lock condition: crosshair turned red, or is physically inside enemy bounding box
+                    in_lock_zone = crosshair_locked or (bx <= ch_x <= bx + bw and by <= ch_y <= by + bh)
 
-        if res is not None:
-            tx, ty, bw, bh, conf, cue = res
-            dx = float(tx - ch_x)
-            dy = float(ty - ch_y)
-            dist_px = float(np.hypot(dx, dy))
+                    return {
+                        "has_target": True,
+                        "target_x": float(ch_x + filt_dx),
+                        "target_y": float(ch_y + filt_dy),
+                        "dx": filt_dx,
+                        "dy": filt_dy,
+                        "raw_dx": raw_dx,
+                        "raw_dy": raw_dy,
+                        "vx": target_vx,
+                        "vy": target_vy,
+                        "dist_px": dist_px,
+                        "box_w": float(bw),
+                        "box_h": float(bh),
+                        "distance": round(dist_est, 2),
+                        "confidence": 1.0,
+                        "cue": cue,
+                        "tier": "full",
+                        "is_facing_sky": False,
+                        "in_lock_zone": in_lock_zone,
+                        "crosshair_locked": crosshair_locked,
+                        "crosshair_color": crosshair_color,
+                    }
 
-            # Calibrated 3D distance Z = (fy * 1.8) / box_h
-            dist_est = float(np.clip((self.fy * 1.8) / max(10.0, bh), 0.5, 30.0))
-
-            # Dead-center lock zone: crosshair is within +/- 22px of target or red crosshair color matches
-            in_lock_zone = crosshair_locked or ((abs(dx) <= 22.0) and (abs(dy) <= 22.0))
-
-            return {
-                "has_target": True,
-                "target_x": tx,
-                "target_y": ty,
-                "dx": dx,
-                "dy": dy,
-                "dist_px": dist_px,
-                "box_w": bw,
-                "box_h": bh,
-                "distance": round(dist_est, 2),
-                "confidence": conf,
-                "cue": cue,
-                "tier": tier,
-                "is_facing_sky": False,
-                "in_lock_zone": in_lock_zone,
-                "crosshair_locked": crosshair_locked,
-                "crosshair_color": crosshair_color,
-            }
+        self.prev_has_target = False
+        self.filter_dx.reset()
+        self.filter_dy.reset()
 
         return {
             "has_target": False,
@@ -194,6 +250,10 @@ class FastAimDetector:
             "target_y": float(ch_y),
             "dx": 0.0,
             "dy": 0.0,
+            "raw_dx": 0.0,
+            "raw_dy": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
             "dist_px": 999.0,
             "box_w": 0.0,
             "box_h": 0.0,

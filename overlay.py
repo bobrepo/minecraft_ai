@@ -52,6 +52,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         "score": 0.0,
         "reward": 0.0,
         "tps": 20.0,
+        "speed_mode": "auto",
     }
 
     # --- Header / Movable Bar ---
@@ -124,9 +125,16 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     )
     pin_btn.pack(side=tk.RIGHT, padx=(2, 4), pady=6)
 
-    # Run / Stop Action Button
+    # Run / Stop Action Button (When clicked to stop, instantly freezes aim)
     def on_action_button_click():
         new_active = not state["active"]
+        if not new_active:
+            # STOP ACTIVATED: immediately abort aim movement
+            cmd_queue.put({"action": "stop_aim"})
+            state["aim_vx"] = 0.0
+            state["aim_vy"] = 0.0
+            if "mouse_canvas" in locals() and "arrow_id" in locals():
+                mouse_canvas.coords(arrow_id, mc_x, mc_y, mc_x, mc_y)
         cmd_queue.put({"action": "set_active", "value": new_active})
         # Optimistic local update
         apply_active_state(new_active)
@@ -235,12 +243,53 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     )
     reward_tick_lbl.pack(side=tk.RIGHT, padx=6, pady=2)
 
+    # 4. Aim Speed Controller Strip (AI Autonomous Dynamic Speed or User Override)
+    speed_frame = tk.Frame(content_frame, bg="#27272a", relief=tk.FLAT, bd=0)
+    speed_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+    speed_title_lbl = tk.Label(
+        speed_frame, text="AIM SPEED:", bg="#27272a", fg="#a1a1aa", font=("Segoe UI", 8, "bold")
+    )
+    speed_title_lbl.pack(side=tk.LEFT, padx=6, pady=2)
+
+    speed_modes = ["auto", "0.5x", "1.0x", "1.5x", "2.0x"]
+
+    def _update_speed_btn(mode_str: str):
+        mode_text = "⚡ AUTO (AI)" if mode_str == "auto" else f"⚡ {mode_str.upper()}"
+        mode_color = "#38bdf8" if mode_str == "auto" else ("#22c55e" if mode_str in ("1.0x", "1.5x") else "#fbbf24")
+        speed_btn.config(text=mode_text, fg=mode_color)
+
+    def on_toggle_speed():
+        curr_mode = state.get("speed_mode", "auto")
+        curr_idx = speed_modes.index(curr_mode) if curr_mode in speed_modes else 0
+        next_mode = speed_modes[(curr_idx + 1) % len(speed_modes)]
+        state["speed_mode"] = next_mode
+        cmd_queue.put({"action": "set_speed_mode", "mode": next_mode})
+        _update_speed_btn(next_mode)
+
+    speed_btn = tk.Button(
+        speed_frame,
+        text="⚡ AUTO (AI)",
+        bg="#18181b",
+        fg="#38bdf8",
+        activebackground="#27272a",
+        activeforeground="#ffffff",
+        font=("Segoe UI", 8, "bold"),
+        relief=tk.FLAT,
+        bd=0,
+        padx=8,
+        pady=1,
+        cursor="hand2",
+        command=on_toggle_speed,
+    )
+    speed_btn.pack(side=tk.RIGHT, padx=6, pady=2)
+
     # Weapon Recharge Progress Bar
     cd_canvas = tk.Canvas(content_frame, width=230, height=6, bg="#27272a", highlightthickness=0)
     cd_canvas.pack(padx=10, pady=(0, 4))
     cd_bar = cd_canvas.create_rectangle(0, 0, 230, 6, fill="#22c55e", width=0)
 
-    # 3. Mouse Pad Canvas (matches media_1789353731042.png)
+    # 5. Mouse Pad Canvas (matches media_1789353731042.png)
     mouse_canvas = tk.Canvas(
         content_frame, width=230, height=115, bg="#0d0d11", highlightthickness=1, highlightbackground="#3f3f46"
     )
@@ -258,27 +307,18 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         mc_x, mc_y, mc_x, mc_y, fill="#06b6d4", width=3, arrow=tk.LAST, arrowshape=(9, 11, 4)
     )
     mouse_canvas.create_text(
-        mc_x, 14, text="AIM MOVEMENT VECTOR", fill="#52525b", font=("Segoe UI", 7, "bold")
+        mc_x, 14, text="AIM TRACE", fill="#3f3f46", font=("Segoe UI", 7, "bold")
     )
 
-    # 4. Left Click Indicator Box (bottom of mouse pad)
-    lmb_frame = tk.Frame(content_frame, bg="#18181b")
-    lmb_frame.pack(fill=tk.X, padx=10, pady=(4, 6))
-    lmb_box = tk.Label(
-        lmb_frame,
-        text="⚡ LEFT CLICK (ATTACK)",
-        height=2,
-        bg="#27272a",
-        fg="#a1a1aa",
-        font=("Segoe UI", 9, "bold"),
-        relief=tk.RIDGE,
-        bd=1,
+    # Coordinates readout
+    coord_lbl = tk.Label(
+        content_frame, text="Δ 0x  0y", bg="#18181b", fg="#71717a", font=("Consolas", 8)
     )
-    lmb_box.pack(fill=tk.X)
+    coord_lbl.pack(pady=2)
 
-    # 5. Footer Stats Strip (TPS & Rate indicator)
+    # 6. Status Strip Footer
     footer_frame = tk.Frame(content_frame, bg="#18181b")
-    footer_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+    footer_frame.pack(fill=tk.X, padx=10, pady=(2, 6))
 
     tps_lbl = tk.Label(
         footer_frame, text="⚡ RATE: 20.0 TPS", bg="#18181b", fg="#38bdf8", font=("Segoe UI", 8, "bold")
@@ -309,9 +349,13 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
             sign = "+" if state["score"] > 0 else ""
             header_score_lbl.config(text=f"[{sign}{state['score']:,.0f} pts]" if state["score"] != 0 else "")
         else:
-            status_pill.config(text="○ STOPPED", fg="#a1a1aa")
+            status_pill.config(text="○ STOPPED (AIM HALTED)", fg="#ef4444")
             action_btn.config(text="▶ RUN AI", bg="#16a34a", activebackground="#22c55e")
             header_score_lbl.config(text="")
+            target_lbl.config(text="Target: ⏹ AIM HALTED", fg="#ef4444")
+            state["aim_vx"] = 0.0
+            state["aim_vy"] = 0.0
+            mouse_canvas.coords(arrow_id, mc_x, mc_y, mc_x, mc_y)
         update_window_expansion()
 
     def set_key_style(widget, is_pressed: bool, active_bg="#10b981", active_fg="#ffffff"):
@@ -382,9 +426,13 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                                 fg="#38bdf8" if is_guess else "#22c55e",
                             )
                         elif locked:
-                            target_lbl.config(text=f"Target: 🎯 {dist:.1f} blk", fg="#22c55e")
+                            target_lbl.config(text=f"Target: 🟡 {dist:.1f} blk", fg="#eab308")
                         elif predicting:
-                            target_lbl.config(text=f"Target: ⤑ {pred_dir}", fg="#06b6d4")
+                            target_lbl.config(text=f"Target: ⤑ {pred_dir}", fg="#a855f7")
+                        elif abs(raw_dx) > 300:
+                            target_lbl.config(text="Target: 🔄 180° BACKFLIP", fg="#c084fc")
+                        elif abs(raw_dx) > 100:
+                            target_lbl.config(text="Target: ⚡ FAST TRACK", fg="#c084fc")
                         else:
                             target_lbl.config(text="Target: 🔍 SCANNING", fg="#a1a1aa")
 
@@ -463,6 +511,13 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                             ms_tick = 1000.0 / max(1.0, cur_tps)
                             tick_time_lbl.config(text=f"{ms_tick:.1f}ms / tk")
 
+                        # Aim Speed Mode sync from agent
+                        if "speed_mode" in msg:
+                            rem_speed = str(msg["speed_mode"]).lower()
+                            if rem_speed and rem_speed != state.get("speed_mode"):
+                                state["speed_mode"] = rem_speed
+                                _update_speed_btn(rem_speed)
+
         except Exception:
             pass
 
@@ -482,10 +537,8 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                 mouse_canvas.itemconfig(arrow_id, width=0)
 
             # LMB flash decay
-            if state["lmb_flash"] > 0:
+            if state.get("lmb_flash", 0) > 0:
                 state["lmb_flash"] -= 1
-                if state["lmb_flash"] == 0:
-                    lmb_box.config(bg="#27272a", fg="#a1a1aa", relief=tk.RIDGE)
 
             # Event badge decay
             if state["event_timer"] > 0:
@@ -494,29 +547,31 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
             else:
                 event_lbl.config(text="")
 
+        # Schedule next tick (~40 FPS UI animation)
         root.after(25, poll_data)
 
-    root.after(25, poll_data)
+    # Start polling loop
+    root.after(50, poll_data)
     root.mainloop()
 
 
-class PvPOverlayClient:
-    """Client interface for controlling and updating the PvP desktop overlay.
+# Alias for backward compatibility
+run_overlay_process = _overlay_process_main
 
-    Non-blocking, zero-lag, thread-safe, and crash-resilient.
-    """
+
+class PvPOverlayClient:
+    """Non-blocking IPC client for communicating with the desktop overlay process."""
 
     def __init__(self):
-        self._data_queue: mp.Queue = mp.Queue()
         self._cmd_queue: mp.Queue = mp.Queue()
+        self._data_queue: mp.Queue = mp.Queue()
         self._process: Optional[mp.Process] = None
-        self._is_running: bool = False
+        self._is_running = False
 
     def start(self):
-        """Start the overlay GUI in an isolated background process."""
+        """Spawn the desktop overlay process."""
         if self._is_running:
             return
-
         self._process = mp.Process(
             target=_overlay_process_main,
             args=(self._data_queue, self._cmd_queue),
@@ -550,6 +605,7 @@ class PvPOverlayClient:
         pos_3d: Optional[Dict[str, float]] = None,
         is_guessing: bool = False,
         phase: str = "",
+        speed_mode: str = "",
     ):
         """Enqueue state update for overlay rendering (takes <0.005ms)."""
         if not self._is_running:
@@ -579,6 +635,7 @@ class PvPOverlayClient:
             "pos_3d": pos_3d,
             "is_guessing": is_guessing,
             "phase": phase,
+            "speed_mode": speed_mode,
         }
         try:
             self._data_queue.put_nowait(msg)

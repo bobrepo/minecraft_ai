@@ -4,7 +4,13 @@ This project is in early development and represents the first working piece of a
 ---
 
 ## Gameplay Preview
-
+# Version 1:
 <video src="vid/test_horizontal.mp4" controls="controls" width="100%"></video>
 
 [Download or view the demo video](vid/test_horizontal.mp4)
+
+
+#Version 2:
+<video src="vid/updatedv2_hori.mp4" controls="controls" width="100%"></video>
+
+[Download or view the demo video](vid/updatedv2_hori.mp4)

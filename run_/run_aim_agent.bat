@@ -4,11 +4,11 @@ cd /d "%~dp0\.."
 
 echo ========================================================
 echo   Minecraft AI: Aim Agent (Stage 1)
-echo   Target:     Cyan Glowing Hitbox + Red Crosshair Sensor
+echo   Target:     Yellow (#FFF500) Enemy Body
 echo   Vision:     Crosshair-Centric Outward Scan (Sub-0.5ms)
 echo   Capture:    Async DirectX/OpenGL Frame Buffer
-echo   Aim Mode:   HORIZONTAL ONLY (Yaw Alignment)
-echo   Rate:       60 FPS Ultra-Smooth Tracking
+echo   Aim Mode:   FULL 2D LOCK (Horizontal Yaw + Vertical Pitch)
+echo   Rate:       60 FPS Ultra-Smooth Zero-Bounce Tracking
 echo ========================================================
 echo.
 echo Controls:

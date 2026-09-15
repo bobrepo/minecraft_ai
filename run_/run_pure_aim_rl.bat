@@ -12,11 +12,11 @@ echo   Training:   Asynchronous Background GPU Optimization
 echo ========================================================
 echo.
 echo Reward System:
-echo   Dead-Center Lock:     +12.0 pts/tick
-echo   Aim Alignment (Dense): +8.0 * (1 - dist_norm)^1.5
-echo   Aim Progress:         +6.0 * (prev_dist - cur_dist)
-echo   Lock Duration Streak: +1.5 * streak
-echo   Sky Penalty:          -2.5 pts (Looking at empty sky)
+echo   Dwell Lock Requirement: 10+ ticks sustained on enemy
+echo   Steady Lock Reward:     +8.0 to +12.0 pts/tick (Dwell Streak)
+echo   Moving / Sweeping Aim:  0.0 pts (Continuous move resets streak)
+echo   Target Regression:      -1.5 to -5.0 pts (Moving away from target)
+echo   Off-Target Delay:       -2.0 to -5.0 pts (Staring without locking)
 echo ========================================================
 echo Controls:
 echo   [F6]            : TOGGLE RL AIM BOT ON / OFF (Audio Beep Feedback)
