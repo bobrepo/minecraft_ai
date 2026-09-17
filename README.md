@@ -13,3 +13,7 @@ https://github.com/user-attachments/assets/f5228483-6bf6-4199-bcf3-1607df37c6e4
 
 https://github.com/user-attachments/assets/aeba0757-c942-4df2-8db3-3280ecc5b52b
 
+# Version 2 : full aim (added vertical dimension)
+
+https://github.com/user-attachments/assets/4df5fd62-e060-4475-96ad-62499588fd07
+
