@@ -161,6 +161,49 @@ class TestWarmTransfer(unittest.TestCase):
         torch.testing.assert_close(w17[3], d9["yaw_head.2.weight"][0])
         torch.testing.assert_close(w17[13], d9["yaw_head.2.weight"][8])
 
+    def test_differential_learning_rates_protect_yaw(self):
+        """Verify differential learning rate groups protect yaw mastery while enabling pitch learning."""
+        lr = 3e-4
+        q_net = BranchingDuelingQNet(state_dim=10, yaw_dim=17, pitch_dim=7)
+        param_groups = [
+            {"params": q_net.shared.parameters(), "lr": lr * 0.25},
+            {"params": q_net.val_head.parameters(), "lr": lr * 0.25},
+            {"params": q_net.yaw_head.parameters(), "lr": lr * 0.20},
+            {"params": q_net.pitch_head.parameters(), "lr": lr},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+
+        # Verify pitch has full learning rate while yaw and backbone have protected lower rates
+        self.assertEqual(optimizer.param_groups[0]["lr"], lr * 0.25)
+        self.assertEqual(optimizer.param_groups[1]["lr"], lr * 0.25)
+        self.assertEqual(optimizer.param_groups[2]["lr"], lr * 0.20)
+        self.assertEqual(optimizer.param_groups[3]["lr"], lr)
+
+    def test_simultaneous_2d_select_action(self):
+        """Verify PureAimRLAgent select_action commands both yaw and pitch concurrently in 2D mode."""
+        agent = MagicMock()
+        agent.env = MagicMock()
+        agent.env.horizontal_only = False
+        agent.env.YAW_ACTIONS = [-160.0, -110.0, -75.0, -50.0, -32.0, -18.0, -8.0, -3.0, 0.0, 3.0, 8.0, 18.0, 32.0, 50.0, 75.0, 110.0, 160.0]
+        agent.last_seen_dir = 1
+        agent.epsilon = 0.0  # Pure exploitation
+
+        q_net = BranchingDuelingQNet(state_dim=10, yaw_dim=17, pitch_dim=7)
+        agent.q_net = q_net
+        agent.device = torch.device("cpu")
+
+        select_fn = PureAimRLAgent.select_action.__get__(agent, PureAimRLAgent)
+
+        # Off-center in both axes: dx = -50 (enemy left), dy = -25 (enemy up)
+        det = {"has_target": True, "dx": -50.0, "dy": -25.0, "vx": 0.0, "vy": 0.0}
+        act = select_fn(np.zeros(10, dtype=np.float32), det)
+
+        self.assertIsInstance(act, tuple)
+        self.assertEqual(len(act), 2)
+        yaw_act, pitch_act = act
+        self.assertTrue(0 <= yaw_act < 17)
+        self.assertTrue(0 <= pitch_act < 7)
+
 
 if __name__ == "__main__":
     unittest.main()

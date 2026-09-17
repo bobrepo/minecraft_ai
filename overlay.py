@@ -28,9 +28,9 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     root.configure(bg="#18181b")
 
     # Geometry constants
-    width = 264
+    width = 310
     collapsed_h = 46
-    expanded_h = 532
+    expanded_h = 560
 
     # Initial position: top-left with safe margins
     pos_x = 24
@@ -60,27 +60,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     header.pack(fill=tk.X, side=tk.TOP)
     header.pack_propagate(False)
 
-    drag_icon = tk.Label(
-        header, text="⋮⋮ ⚔️", fg="#f4f4f5", bg="#27272a", font=("Segoe UI", 9, "bold"), cursor="fleur"
-    )
-    drag_icon.pack(side=tk.LEFT, padx=(6, 2), pady=6)
-
-    status_pill = tk.Label(
-        header, text="○ OFF", fg="#a1a1aa", bg="#27272a", font=("Segoe UI", 8, "bold")
-    )
-    status_pill.pack(side=tk.LEFT, padx=2)
-
-    tps_pill = tk.Label(
-        header, text="20.0 TPS", fg="#38bdf8", bg="#27272a", font=("Segoe UI", 8, "bold")
-    )
-    tps_pill.pack(side=tk.LEFT, padx=2)
-
-    header_score_lbl = tk.Label(
-        header, text="", fg="#fbbf24", bg="#27272a", font=("Segoe UI", 8, "bold")
-    )
-    header_score_lbl.pack(side=tk.LEFT, padx=2)
-
-    # Close button (signals agent to stop and quit)
+    # 1. Close button (signals agent to stop and quit - packed first so it is ALWAYS visible on far right)
     def on_close_click():
         cmd_queue.put({"action": "quit"})
         root.destroy()
@@ -89,20 +69,22 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         header,
         text="✕",
         bg="#27272a",
-        fg="#71717a",
+        fg="#a1a1aa",
         activebackground="#ef4444",
         activeforeground="#ffffff",
-        font=("Segoe UI", 8),
+        font=("Segoe UI", 9, "bold"),
         relief=tk.FLAT,
         bd=0,
-        padx=4,
+        padx=5,
         pady=2,
         cursor="hand2",
         command=on_close_click,
     )
-    close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=6)
+    close_btn.pack(side=tk.RIGHT, padx=(0, 6), pady=6)
+    close_btn.bind("<Enter>", lambda e: close_btn.config(bg="#ef4444", fg="#ffffff"))
+    close_btn.bind("<Leave>", lambda e: close_btn.config(bg="#27272a", fg="#a1a1aa"))
 
-    # Pin button (allows keeping expanded even when stopped)
+    # 2. Pin button (allows keeping expanded even when stopped)
     def on_toggle_pin():
         state["pinned"] = not state["pinned"]
         pin_btn.config(fg="#22c55e" if state["pinned"] else "#71717a")
@@ -125,7 +107,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
     )
     pin_btn.pack(side=tk.RIGHT, padx=(2, 4), pady=6)
 
-    # Run / Stop Action Button (When clicked to stop, instantly freezes aim)
+    # 3. Run / Stop Action Button (When clicked to stop, instantly freezes aim)
     def on_action_button_click():
         new_active = not state["active"]
         if not new_active:
@@ -155,6 +137,27 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
         command=on_action_button_click,
     )
     action_btn.pack(side=tk.RIGHT, padx=4, pady=6)
+
+    # 4. Left-side Indicators & Drag Grip
+    drag_icon = tk.Label(
+        header, text="⋮⋮ ⚔️", fg="#f4f4f5", bg="#27272a", font=("Segoe UI", 9, "bold"), cursor="fleur"
+    )
+    drag_icon.pack(side=tk.LEFT, padx=(6, 2), pady=6)
+
+    status_pill = tk.Label(
+        header, text="○ STOPPED", fg="#ef4444", bg="#27272a", font=("Segoe UI", 8, "bold")
+    )
+    status_pill.pack(side=tk.LEFT, padx=2)
+
+    tps_pill = tk.Label(
+        header, text="60.0 TPS", fg="#38bdf8", bg="#27272a", font=("Segoe UI", 8, "bold")
+    )
+    tps_pill.pack(side=tk.LEFT, padx=2)
+
+    header_score_lbl = tk.Label(
+        header, text="", fg="#fbbf24", bg="#27272a", font=("Segoe UI", 8, "bold")
+    )
+    header_score_lbl.pack(side=tk.LEFT, padx=2)
 
     # Dragging logic
     drag_data = {"offset_x": 0, "offset_y": 0}
@@ -312,9 +315,23 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
 
     # Coordinates readout
     coord_lbl = tk.Label(
-        content_frame, text="Δ 0x  0y", bg="#18181b", fg="#71717a", font=("Consolas", 8)
+        content_frame, text="Δ +0x  +0y", bg="#18181b", fg="#71717a", font=("Consolas", 8)
     )
     coord_lbl.pack(pady=2)
+
+    # 5b. Left Click (Attack) Box
+    lmb_box = tk.Label(
+        content_frame,
+        text="⚔️ ATTACK (LMB)",
+        width=23,
+        height=1,
+        bg="#27272a",
+        fg="#71717a",
+        font=("Segoe UI", 8, "bold"),
+        relief=tk.RIDGE,
+        bd=1,
+    )
+    lmb_box.pack(pady=(0, 4))
 
     # 6. Status Strip Footer
     footer_frame = tk.Frame(content_frame, bg="#18181b")
@@ -349,13 +366,15 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
             sign = "+" if state["score"] > 0 else ""
             header_score_lbl.config(text=f"[{sign}{state['score']:,.0f} pts]" if state["score"] != 0 else "")
         else:
-            status_pill.config(text="○ STOPPED (AIM HALTED)", fg="#ef4444")
+            status_pill.config(text="○ STOPPED", fg="#ef4444")
             action_btn.config(text="▶ RUN AI", bg="#16a34a", activebackground="#22c55e")
             header_score_lbl.config(text="")
             target_lbl.config(text="Target: ⏹ AIM HALTED", fg="#ef4444")
             state["aim_vx"] = 0.0
             state["aim_vy"] = 0.0
             mouse_canvas.coords(arrow_id, mc_x, mc_y, mc_x, mc_y)
+            lmb_box.config(bg="#27272a", fg="#71717a", relief=tk.RIDGE)
+            coord_lbl.config(text="Δ +0x  +0y")
         update_window_expansion()
 
     def set_key_style(widget, is_pressed: bool, active_bg="#10b981", active_fg="#ffffff"):
@@ -395,6 +414,7 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         # Mouse Aim Vector
                         raw_dx = msg.get("dx", 0)
                         raw_dy = msg.get("dy", 0)
+                        coord_lbl.config(text=f"Δ {raw_dx:+d}x  {raw_dy:+d}y")
                         if raw_dx != 0 or raw_dy != 0:
                             # Scale with bounds
                             target_vx = max(-48.0, min(48.0, float(raw_dx) * 1.6))
@@ -419,6 +439,8 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                         is_guess = msg.get("is_guessing", False)
                         phase = msg.get("phase", "")
 
+                        height_zone = msg.get("height_zone", "")
+
                         if locked and pos_3d:
                             tag = "~" if is_guess else ""
                             target_lbl.config(
@@ -426,13 +448,28 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                                 fg="#38bdf8" if is_guess else "#22c55e",
                             )
                         elif locked:
-                            target_lbl.config(text=f"Target: 🟡 {dist:.1f} blk", fg="#eab308")
+                            dist_str = f" ({dist:.1f} blk)" if dist > 0.0 else ""
+                            target_lbl.config(text=f"Target: 🟡 CENTER LOCKED{dist_str}", fg="#eab308")
+                        elif height_zone == "FEET":
+                            dist_str = f" ({dist:.1f}m)" if dist > 0.0 else ""
+                            target_lbl.config(text=f"Target: ⬆️ AIM HIGHER (FEET){dist_str}", fg="#f59e0b")
+                        elif height_zone == "HEAD":
+                            dist_str = f" ({dist:.1f}m)" if dist > 0.0 else ""
+                            target_lbl.config(text=f"Target: ⬇️ AIM LOWER (HEAD){dist_str}", fg="#f59e0b")
+                        elif height_zone == "ABOVE":
+                            target_lbl.config(text="Target: ⬇️ AIM DOWN (ABOVE)", fg="#ef4444")
+                        elif height_zone == "BELOW":
+                            target_lbl.config(text="Target: ⬆️ AIM UP (BELOW)", fg="#ef4444")
                         elif predicting:
                             target_lbl.config(text=f"Target: ⤑ {pred_dir}", fg="#a855f7")
-                        elif abs(raw_dx) > 300:
+                        elif phase == "AIM:FLIP" or abs(raw_dx) > 300:
                             target_lbl.config(text="Target: 🔄 180° BACKFLIP", fg="#c084fc")
+                        elif phase == "AIM:SWEEP":
+                            target_lbl.config(text="Target: ↔️ SWEEPING", fg="#38bdf8")
                         elif abs(raw_dx) > 100:
                             target_lbl.config(text="Target: ⚡ FAST TRACK", fg="#c084fc")
+                        elif dist > 0.0 or (raw_dx != 0 or raw_dy != 0):
+                            target_lbl.config(text=f"Target: 🎯 TRACKING ({dist:.1f}m)" if dist > 0.0 else "Target: 🎯 TRACKING", fg="#06b6d4")
                         else:
                             target_lbl.config(text="Target: 🔍 SCANNING", fg="#a1a1aa")
 
@@ -472,6 +509,14 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
                                 state["event_color"] = "#a855f7"
                             elif "RESET" in phase:
                                 state["event_color"] = "#f59e0b"
+                            elif "LOCK" in phase:
+                                state["event_color"] = "#eab308"
+                            elif "2D" in phase or "AIM" in phase:
+                                state["event_color"] = "#06b6d4"
+                            elif "FLIP" in phase:
+                                state["event_color"] = "#c084fc"
+                            elif "SWEEP" in phase:
+                                state["event_color"] = "#38bdf8"
                             else:
                                 state["event_color"] = "#71717a"
                             event_lbl.config(text=state["event_text"], fg=state["event_color"])
@@ -539,6 +584,8 @@ def _overlay_process_main(data_queue: mp.Queue, cmd_queue: mp.Queue):
             # LMB flash decay
             if state.get("lmb_flash", 0) > 0:
                 state["lmb_flash"] -= 1
+                if state["lmb_flash"] == 0:
+                    lmb_box.config(bg="#27272a", fg="#71717a", relief=tk.RIDGE)
 
             # Event badge decay
             if state["event_timer"] > 0:
@@ -606,6 +653,8 @@ class PvPOverlayClient:
         is_guessing: bool = False,
         phase: str = "",
         speed_mode: str = "",
+        height_zone: str = "NONE",
+        **kwargs,
     ):
         """Enqueue state update for overlay rendering (takes <0.005ms)."""
         if not self._is_running:
@@ -636,6 +685,8 @@ class PvPOverlayClient:
             "is_guessing": is_guessing,
             "phase": phase,
             "speed_mode": speed_mode,
+            "height_zone": height_zone,
+            **kwargs,
         }
         try:
             self._data_queue.put_nowait(msg)

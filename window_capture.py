@@ -501,40 +501,35 @@ class AsyncWindowCapture:
         self.window_title = self.cap.window_title
         _, _, self.w, self.h = win32gui.GetClientRect(self.hwnd)
 
-        self.hwnd_dc = win32gui.GetDC(self.hwnd)
-        self.mfc_dc = win32ui.CreateDCFromHandle(self.hwnd_dc)
-        self.save_dc = self.mfc_dc.CreateCompatibleDC()
-        self.save_bitmap = win32ui.CreateBitmap()
-        self.save_bitmap.CreateCompatibleBitmap(self.mfc_dc, self.w, self.h)
-        self.save_dc.SelectObject(self.save_bitmap)
-        self.hdc_safe = self.save_dc.GetSafeHdc()
 
         self._latest_frame: Optional[np.ndarray] = None
+        self._frame_timestamp: float = 0.0
+        self._frame_seq: int = 0
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._capture_worker, daemon=True)
         self._thread.start()
 
         # Wait briefly for first frame
-        for _ in range(25):
+        for _ in range(30):
             if self._latest_frame is not None:
                 break
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     def _capture_worker(self):
         while self._running:
             try:
                 if not win32gui.IsWindow(self.hwnd):
                     break
-                res = user32.PrintWindow(self.hwnd, self.hdc_safe, 2)
-                if res:
-                    bmpstr = self.save_bitmap.GetBitmapBits(True)
-                    frame = np.frombuffer(bmpstr, dtype=np.uint8).reshape((self.h, self.w, 4))[:, :, :3]
+                success, frame = self.cap.get_frame()
+                if success and frame is not None:
                     with self._lock:
                         self._latest_frame = frame
+                        self._frame_timestamp = time.perf_counter()
+                        self._frame_seq += 1
             except Exception:
                 pass
-            time.sleep(0.005)
+            time.sleep(0.001)
 
     def is_valid(self) -> bool:
         return self.cap.is_valid() and self._running
@@ -543,18 +538,20 @@ class AsyncWindowCapture:
         with self._lock:
             if self._latest_frame is not None:
                 return True, self._latest_frame
-        return False, None
+        # Fallback to direct synchronous capture if background worker hasn't populated yet
+        return self.cap.get_frame()
+
+    def get_frame_info(self) -> Tuple[bool, Optional[np.ndarray], float, int]:
+        """Return (success, frame, timestamp, sequence_number) for latency profiling."""
+        with self._lock:
+            if self._latest_frame is not None:
+                return True, self._latest_frame, self._frame_timestamp, self._frame_seq
+        suc, frame = self.cap.get_frame()
+        return suc, frame, time.perf_counter(), 0
 
     def close(self):
         self._running = False
         if self._thread.is_alive():
             self._thread.join(timeout=0.5)
-        try:
-            win32gui.DeleteObject(self.save_bitmap.GetHandle())
-            self.save_dc.DeleteDC()
-            self.mfc_dc.DeleteDC()
-            win32gui.ReleaseDC(self.hwnd, self.hwnd_dc)
-        except Exception:
-            pass
         self.cap.close()
 

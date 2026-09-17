@@ -178,5 +178,53 @@ class TestEnvSpeedMultiplier(unittest.TestCase):
         self.assertAlmostEqual(dispatched_yaw, 112.5, places=1)
 
 
+class TestOverlayHeaderLayout(unittest.TestCase):
+    """Test overlay header widgets layout to ensure close button and controls are never squeezed out."""
+
+    def test_header_controls_always_visible_when_stopped(self):
+        """Verify close button, pin button, and action button are fully visible on width 310."""
+        import tkinter as tk
+
+        root = tk.Tk()
+        width = 310
+        collapsed_h = 46
+        header = tk.Frame(root, bg="#27272a", height=collapsed_h)
+        header.pack(fill=tk.X, side=tk.TOP)
+        header.pack_propagate(False)
+
+        close_btn = tk.Button(header, text="✕", font=("Segoe UI", 9, "bold"), bd=0, padx=5, pady=2)
+        close_btn.pack(side=tk.RIGHT, padx=(0, 6), pady=6)
+
+        pin_btn = tk.Button(header, text="📌", font=("Segoe UI", 8), bd=0, padx=3, pady=2)
+        pin_btn.pack(side=tk.RIGHT, padx=(2, 4), pady=6)
+
+        action_btn = tk.Button(header, text="▶ RUN AI", font=("Segoe UI", 9, "bold"), bd=0, padx=8, pady=2)
+        action_btn.pack(side=tk.RIGHT, padx=4, pady=6)
+
+        drag_icon = tk.Label(header, text="⋮⋮ ⚔️", font=("Segoe UI", 9, "bold"))
+        drag_icon.pack(side=tk.LEFT, padx=(6, 2), pady=6)
+
+        status_pill = tk.Label(header, text="○ STOPPED", font=("Segoe UI", 8, "bold"))
+        status_pill.pack(side=tk.LEFT, padx=2)
+
+        tps_pill = tk.Label(header, text="60.0 TPS", font=("Segoe UI", 8, "bold"))
+        tps_pill.pack(side=tk.LEFT, padx=2)
+
+        root.geometry(f"{width}x{collapsed_h}+50+50")
+        root.update()
+
+        self.assertEqual(close_btn.winfo_viewable(), 1)
+        self.assertGreater(close_btn.winfo_width(), 15)
+        self.assertLessEqual(close_btn.winfo_x() + close_btn.winfo_width(), width)
+
+        self.assertEqual(action_btn.winfo_viewable(), 1)
+        self.assertGreater(action_btn.winfo_width(), 50)
+
+        self.assertEqual(pin_btn.winfo_viewable(), 1)
+        self.assertGreater(pin_btn.winfo_width(), 15)
+
+        root.destroy()
+
+
 if __name__ == "__main__":
     unittest.main()

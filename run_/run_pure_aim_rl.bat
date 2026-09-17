@@ -4,11 +4,12 @@ cd /d "%~dp0\.."
 
 echo ========================================================
 echo   Minecraft AI: Stage 1 Pure Reinforcement Learning Aim
-echo   Goal:       Pure Opponent Aiming (No movement WASD/jump)
-echo   Algorithm:  Branching Dueling Double Deep Q-Network
-echo   Detector:   Crosshair-Centric Cyan Highlight + Red/Purple Lock (Sub-0.5ms)
+echo   Target:     Yellow (#FFF500) Enemy Body
+echo   Algorithm:  Branching Dueling Double Deep Q-Network (BD-DQN)
+echo   Aim Mode:   FULL 2D AIM RL (Horizontal Yaw + Vertical Pitch Simultaneous Learning)
 echo   Rate:       Locked 60.00 FPS (16.6ms Interval)
-echo   Training:   Asynchronous Background GPU Optimization
+echo   Training:   Asynchronous Background GPU Optimization (Continual Learning)
+echo   Checkpoints: Rolling 20-min saves to saves\ (Max 10 models FIFO)
 echo ========================================================
 echo.
 echo Reward System:

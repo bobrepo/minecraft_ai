@@ -35,7 +35,7 @@ class MinecraftAimEnv:
         resolution: Tuple[int, int] = (640, 480),
         max_episode_steps: int = 200,
         horizontal_only: bool = True,
-        min_lock_ticks: int = 10,
+        min_lock_ticks: int = 1,
     ):
         self.width, self.height = resolution
         self.max_episode_steps = max_episode_steps
@@ -146,27 +146,19 @@ class MinecraftAimEnv:
         return state
 
     def step(self, action: Tuple[int, int]) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """Execute one pure aim environment step.
-
-        Args:
-            action: Tuple (yaw_index [0-16], pitch_index [0-6]).
-
-        Returns:
-            (next_state, reward, done, info)
-        """
+        """Execute one 2D aiming step (discrete yaw + pitch action indices) in Minecraft."""
         self.current_step += 1
         yaw_idx, pitch_idx = action
-        yaw_delta = self.YAW_ACTIONS[yaw_idx]
-        pitch_delta = self.PITCH_ACTIONS[pitch_idx] if not self.horizontal_only else 0.0
+        yaw_delta = float(self.YAW_ACTIONS[yaw_idx])
+        pitch_delta = 0.0 if self.horizontal_only else float(self.PITCH_ACTIONS[pitch_idx])
 
-        # Motion detection: check if camera is moving
-        is_moving = (abs(yaw_delta) > 0.0) or (abs(pitch_delta) > 0.0)
+        # Track intentional movement vs steady hold
+        is_moving = (yaw_delta != 0.0) or (pitch_delta != 0.0)
         if is_moving:
             self.consecutive_moving_ticks += 1
         else:
             self.consecutive_moving_ticks = 0
 
-        # Continuous movement check: moving for >= 2 consecutive ticks, OR flicking/sweeping fast
         is_continuously_moving = (self.consecutive_moving_ticks >= 2) or (abs(yaw_delta) > 3.0) or (abs(pitch_delta) > 2.5)
 
         # 1. Dispatch camera rotation via direct 1:1 hardware SendInput (0ms phase lag)
@@ -185,7 +177,7 @@ class MinecraftAimEnv:
         # 3. Detect updated target position via crosshair-centric search
         det = self.detector.detect(frame, crosshair_centric=True)
 
-        # 4. Compute Reward (View Reward + Heavy Procrastination Penalty + Dwell Lock Bonus)
+        # 4. Compute Reward (Strict Yellow Target: Points ONLY when on yellow; Demerits everywhere else)
         reward = 0.0
         w2 = self.width / 2.0
         d_max = self.diag / 2.0
@@ -195,64 +187,65 @@ class MinecraftAimEnv:
             dy = det["dy"]
             dist_px = det["dist_px"]
 
-            is_locked = bool(det.get("in_lock_zone", False) or det.get("crosshair_locked", False))
+            # Strict Center Lock: give score when crosshair is in the center of enemy body OR on yellow target!
+            crosshair_on_yellow = bool(det.get("crosshair_locked", False))
+            height_zone = det.get("height_zone", "CENTER")
+            is_in_center = bool(
+                det.get("in_center", False)
+                or (
+                    (abs(dx) <= 4.5 and (self.horizontal_only or abs(dy) <= 5.0))
+                    and height_zone in ("CENTER", "NONE")
+                )
+            )
+            # If crosshair is at feet, head, or outside vertical center: strictly NO score unless directly on yellow
+            if height_zone in ("FEET", "HEAD", "ABOVE", "BELOW") and not crosshair_on_yellow:
+                is_in_center = False
+
+            is_locked = bool(is_in_center or crosshair_on_yellow)
 
             if is_locked:
                 self.off_target_ticks = 0
-                if is_continuously_moving:
-                    # STRICT RULE: No points for continuously moving or sweeping across enemy!
-                    # Reset dwell streak so sweeping across enemy cannot accumulate dwell lock time
+                if is_continuously_moving and (abs(yaw_delta) > 50.0 or abs(pitch_delta) > 25.0):
+                    # Wild flick sweeping across screen: streak reset & demerit
                     self.lock_streak = 0
-                    reward = 0.0
-                elif is_moving:
-                    # 1-tick micro-adjustment while on target: 0.0 reward while moving
-                    reward = 0.0
+                    reward = -2.0
                 else:
-                    # Stationary hold on enemy: accumulate dwell time!
+                    # In center of enemy! Award points immediately from tick 1 (less dwell required)
                     self.lock_streak += 1
-                    if self.lock_streak >= self.min_lock_ticks:
-                        # Crosshair held over enemy for sufficient dwell duration
-                        r_lock = 8.0
-                        r_streak = min(4.0, (self.lock_streak - self.min_lock_ticks) * 0.20)
-                        reward = float(r_lock + r_streak)
-                    else:
-                        # Still acquiring / dwelling, not yet held for long enough: 0.0 points
-                        reward = 0.0
+                    r_lock = 8.0
+                    r_streak = min(4.0, max(0.0, self.lock_streak - self.min_lock_ticks) * 0.20)
+                    reward = float(r_lock + r_streak)
             else:
-                # Enemy in view, but crosshair NOT on target -> immediate streak reset
+                # Off center or off target: immediate streak reset & demerit
                 self.lock_streak = 0
                 self.off_target_ticks += 1
 
-                # Directional Progress / Regression Check:
+                # Directional error check
                 if self.prev_has_target:
                     curr_err = abs(dx) if self.horizontal_only else dist_px
                     prev_err = abs(self.prev_dx) if self.horizontal_only else self.prev_dist_px
-                    delta_err = curr_err - prev_err  # > 0 means crosshair moved AWAY from enemy
+                    delta_err = curr_err - prev_err
                 else:
                     delta_err = 0.0
 
                 if delta_err > 0.5:
-                    # Moving AWAY from target (e.g. enemy is left, bot moved right, or overshot)
-                    # Immediate negative penalty proportional to error increase
-                    r_away = 1.5 + min(3.5, delta_err * 0.2)
+                    # Moving AWAY from center of target (overshoot or opposite direction)
+                    r_away = 2.5 + min(2.5, delta_err * 0.2)
                     reward = float(-r_away)
-                elif self.off_target_ticks > 20:
-                    # After grace period: heavy penalty for being late & staring without locking on!
-                    slack_time = (self.off_target_ticks - 20) / 60.0
-                    penalty = 2.0 + min(3.0, slack_time * 2.0)  # -2.0 to -5.0 pts/tick
-                    reward = float(-penalty)
                 else:
-                    # Moving towards target during grace period: strictly 0.0 (no free on-screen points)
-                    reward = 0.0
+                    # Off center (e.g. aimed at feet, head, or outside): STRICT DEMERIT (-2.0 pts/tick)
+                    reward = -2.0
 
             self.prev_dx = dx
             self.prev_dist_px = dist_px
             self.prev_has_target = True
         else:
+            # Target not in view at all (searching / sweeping / lost)
             self.lock_streak = 0
             self.off_target_ticks = 0
             self.prev_has_target = False
-            reward = -0.5
+            # Demerit everywhere else: -2.0 pts/tick
+            reward = -2.0
 
         next_state = self._build_state(det)
 
@@ -262,12 +255,19 @@ class MinecraftAimEnv:
         # Done condition
         done = self.current_step >= self.max_episode_steps
 
-        is_locked_state = bool(det.get("in_lock_zone", False) or det.get("crosshair_locked", False))
+        is_locked_state = is_locked if det["has_target"] else False
+        if det["has_target"]:
+            det["in_center"] = is_locked_state
+            det["in_lock_zone"] = is_locked_state
         info = {
             "detection": det,
             "reward": reward,
             "dist_px": det.get("dist_px", 999.0),
             "in_lock_zone": is_locked_state,
+            "in_center": is_locked_state,
+            "crosshair_locked": crosshair_on_yellow if det["has_target"] else False,
+            "height_zone": det.get("height_zone", "NONE"),
+            "height_ratio": det.get("height_ratio", -1.0),
             "lock_streak": self.lock_streak,
             "is_moving": is_moving,
             "is_continuously_moving": is_continuously_moving,

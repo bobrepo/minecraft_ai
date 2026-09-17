@@ -1,11 +1,11 @@
 """Direct Aim Agent for Highlighted Minecraft Opponents.
 
-Tailored to the user's highlighted enemy appearance (Cyan Glow + Red Cross Target):
-1. Parses highlighted image region using Crosshair-Centric Outward Scanning (sub-0.5ms).
-2. Slowly and smoothly glides cursor towards the center of the screen to align crosshair.
-3. Stage 1 Constraint: Strictly Horizontal movements ONLY (Yaw), pitch locked at 0.0.
+Tailored to the user's highlighted enemy appearance (Yellow #FFF500 Enemy Body + Red Cross Target):
+1. Yellow body detection (BGR ≈ [0, 245, 255]) with Crosshair-Centric Outward Scanning (sub-0.5ms).
+2. Red crosshair lock probe (<0.01ms color check).
+3. Full 2D Aim Lock (Horizontal Yaw + Vertical Pitch simultaneous tracking) with zero bounce.
 4. Single hotkey control: [F6] to start/stop the agent.
-5. High-frequency 60 FPS update rate with Minimum-Jerk sub-tick interpolation.
+5. High-frequency 60 FPS update rate with critically damped motion and 180° backflip on escape.
 """
 
 import argparse
@@ -69,7 +69,7 @@ class AimAgent:
         self.prev_vx = 0.0
         self.prev_dy = 0.0
         self.prev_vy = 0.0
-        self.min_lock_ticks = 10
+        self.min_lock_ticks = 1
         self.lock_streak = 0
         self.consecutive_moving_ticks = 0
         self.cumulative_score = 0.0
@@ -291,15 +291,17 @@ class AimAgent:
                             max_accel_x = 80.0 * speed_mult
                             vx = float(np.clip(target_step_x, self.prev_vx - max_accel_x, self.prev_vx + max_accel_x))
 
-                        # --- Vertical Pitch Tracking (Eliminates the vertical gap) ---
+                        # --- Vertical Pitch Tracking with Sense of Enemy Height ---
                         if not self.horizontal_only:
-                            if abs_dy <= self.lock_deadzone_y_px:
+                            bh = det.get("box_h", 50.0)
+                            lock_deadzone_y = max(4.0, bh * 0.12)
+                            if abs_dy <= lock_deadzone_y:
                                 vy = 0.0
                             else:
-                                desired_vy = sign_y * min(self.max_pitch_step_px, 0.35 * abs_dy)
-                                max_safe_step_y = max(0.0, abs_dy - self.lock_deadzone_y_px * 0.5)
+                                desired_vy = sign_y * min(self.max_pitch_step_px, 0.38 * abs_dy)
+                                max_safe_step_y = max(0.0, abs_dy - lock_deadzone_y * 0.5)
                                 target_step_y = sign_y * min(abs(desired_vy), max_safe_step_y)
-                                max_accel_y = 25.0
+                                max_accel_y = 28.0
                                 vy = float(np.clip(target_step_y, self.prev_vy - max_accel_y, self.prev_vy + max_accel_y))
 
                         self.prev_vx = vx
@@ -340,37 +342,45 @@ class AimAgent:
 
                     det_info = det
                     step_dx = int(vx)
+                    step_dy = int(vy)
 
-                    # Dwell and movement tracking for reward calculation
-                    is_moving = abs(vx) > 0.0
+                    # Dwell and movement tracking for reward calculation (2D motion aware)
+                    is_moving = (abs(vx) > 0.0) or (abs(vy) > 0.0)
                     if is_moving:
                         self.consecutive_moving_ticks += 1
                     else:
                         self.consecutive_moving_ticks = 0
 
-                    is_continuously_moving = (self.consecutive_moving_ticks >= 2) or (abs(vx) > 3.0)
+                    is_continuously_moving = (self.consecutive_moving_ticks >= 2) or (math.hypot(vx, vy) > 3.0)
 
-                    is_locked = bool(det_info.get("in_lock_zone", False) or det_info.get("crosshair_locked", False) or self.is_locked)
+                    # Strict Center-Only Lock: ONLY true when crosshair is in the torso/chest center of enemy OR directly on yellow!
+                    is_locked = bool(det_info.get("crosshair_locked", False) or det_info.get("in_center", False))
+                    self.is_locked = is_locked
                     if is_locked:
-                        if is_continuously_moving:
-                            # No points for continuously moving!
-                            self.lock_streak = 0
-                            step_reward = 0.0
-                        elif is_moving:
-                            step_reward = 0.0
-                        else:
-                            self.lock_streak += 1
-                            if self.lock_streak >= self.min_lock_ticks:
-                                r_lock = 8.0
-                                r_streak = min(4.0, (self.lock_streak - self.min_lock_ticks) * 0.20)
-                                step_reward = float(r_lock + r_streak)
-                            else:
-                                step_reward = 0.0
+                        self.lock_streak += 1
+                        r_lock = 8.0
+                        r_streak = min(4.0, max(0.0, self.lock_streak - self.min_lock_ticks) * 0.20)
+                        step_reward = float(r_lock + r_streak)
                     else:
                         self.lock_streak = 0
-                        step_reward = 0.0
+                        # Anywhere else (feet, head, edge of body, off-target): STRICT DEMERIT (-2.0 pts/tick)
+                        step_reward = -2.0
 
                     self.cumulative_score += step_reward
+
+                    # Dynamic tactical phase reporting with height sense
+                    height_zone = det_info.get("height_zone", "")
+                    if is_locked:
+                        step_phase = "AIM:CENTER"
+                    elif det_info.get("has_target", False):
+                        if height_zone in ("HEAD", "FEET"):
+                            step_phase = f"AIM:{height_zone}"
+                        else:
+                            step_phase = "AIM:2D" if not self.horizontal_only else "AIM:HORIZ"
+                    elif self.lost_target_ticks == 1:
+                        step_phase = "AIM:FLIP"
+                    else:
+                        step_phase = "AIM:SWEEP"
                 else:
                     if _was_active:
                         self.input_ctrl.stop_aim()
@@ -378,26 +388,31 @@ class AimAgent:
                         _was_active = False
                     self.prev_dx = 0.0
                     self.prev_vx = 0.0
+                    self.prev_dy = 0.0
+                    self.prev_vy = 0.0
                     self.is_locked = False
                     self.lock_streak = 0
                     self.consecutive_moving_ticks = 0
-                    det_info = {"has_target": False, "dist_px": 0.0, "in_lock_zone": False}
+                    det_info = {"has_target": False, "dist_px": 0.0, "in_lock_zone": False, "in_center": False, "height_zone": "NONE"}
                     step_dx = 0
+                    step_dy = 0
                     step_reward = 0.0
+                    step_phase = "AIM:IDLE"
 
-                # Update Desktop Overlay
+                # Update Desktop Overlay with Center Lock & Height Zone
                 if self.overlay:
                     self.overlay.update(
                         active=active,
                         dx=step_dx,
-                        dy=0,
-                        target_locked=det_info.get("in_lock_zone", False),
+                        dy=step_dy,
+                        target_locked=bool(det_info.get("crosshair_locked", False) or det_info.get("in_center", False)),
                         target_dist=float(det_info.get("distance", 0.0)),
                         reward=float(step_reward),
                         total_score=float(self.cumulative_score),
                         tps=current_tps,
-                        phase="AIM:HORIZ",
+                        phase=step_phase,
                         speed_mode=self.speed_mode,
+                        height_zone=det_info.get("height_zone", "NONE"),
                     )
 
                 # Strict high-FPS timing

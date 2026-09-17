@@ -1,7 +1,7 @@
 """Ultra-fast real-time opponent detector for Stage 1 Pure Aim RL.
 
 Specialized for Minecraft PvP with Crosshair-Centric Outward Scanning:
-1. Cyan-highlighted enemy body detection (BGRr=[223,255,0]) — primary cue only.
+1. Yellow-highlighted enemy body detection (#FFF500, BGR ≈ [0, 245, 255]) — primary cue only.
 2. Red crosshair lock sensor: center pixel turns RED when crosshair is over enemy.
 3. Sky mask to detect if looking at empty sky.
 
@@ -10,7 +10,7 @@ reducing detection latency to sub-0.5ms.
 
 Crosshair color states (from actual game capture):
   - SEARCHING:   Center pixel is near-black/transparent [14, 7, 6] — white '+' arms offset from center
-  - RED_LOCKED:  Center pixel turns bright RED [33, 1, 255] BGR — crosshair over cyan enemy body
+  - RED_LOCKED:  Center pixel turns bright RED [33, 1, 255] BGR — crosshair over yellow enemy body
 """
 
 import math
@@ -129,7 +129,7 @@ class FastAimDetector:
         ch_x: int,
         ch_y: int,
     ) -> Optional[Tuple[float, float, float, float, float, str]]:
-        """Scan a specific sub-region (ROI) for the cyan-highlighted enemy body."""
+        """Scan a specific sub-region (ROI) for the yellow-highlighted enemy body."""
         rh, rw = roi.shape[:2]
         if rh < 10 or rw < 10:
             return None
@@ -144,9 +144,9 @@ class FastAimDetector:
                 c = max(cnts, key=cv2.contourArea)
                 if cv2.contourArea(c) > 40:
                     bx, by, bw, bh = cv2.boundingRect(c)
-                    # Aim at horizontal center, upper-center (30% from top = torso/chest area)
+                    # Aim at horizontal center, torso/chest center (42% from top of head)
                     tx = offset_x + bx + bw / 2.0
-                    ty = offset_y + by + bh * 0.30
+                    ty = offset_y + by + bh * 0.42
                     return tx, ty, float(bw), float(bh), 1.0, cue
 
         return None
@@ -168,7 +168,7 @@ class FastAimDetector:
         return False, "SEARCHING"
 
     def detect(self, frame: np.ndarray, crosshair_centric: bool = True) -> Dict[str, Any]:
-        """Detect opponent head & body target with sub-1ms robust yellow detection."""
+        """Detect opponent head & body target with sub-1ms robust yellow detection and height sensing."""
         h, w = frame.shape[:2]
         ch_x = w // 2
         ch_y = h // 2
@@ -186,8 +186,9 @@ class FastAimDetector:
                 c = max(cnts, key=cv2.contourArea)
                 if cv2.contourArea(c) > 50:
                     bx, by, bw, bh = cv2.boundingRect(c)
+                    # Target center: horizontal center, upper torso / chest (42% down from top)
                     raw_tx = bx + bw / 2.0
-                    raw_ty = by + bh * 0.30
+                    raw_ty = by + bh * 0.42
                     raw_dx = float(raw_tx - ch_x)
                     raw_dy = float(raw_ty - ch_y)
 
@@ -214,8 +215,36 @@ class FastAimDetector:
                     dist_px = float(np.hypot(filt_dx, filt_dy))
                     dist_est = float(np.clip((self.fy * 1.8) / max(10.0, bh), 0.5, 30.0))
 
-                    # Lock condition: crosshair turned red, or is physically inside enemy bounding box
-                    in_lock_zone = crosshair_locked or (bx <= ch_x <= bx + bw and by <= ch_y <= by + bh)
+                    # Sense of Height of Enemy:
+                    # height_ratio represents crosshair Y position relative to enemy span (0.0 = head, 1.0 = feet)
+                    height_ratio = float((ch_y - by) / max(1.0, bh))
+                    if ch_y < by:
+                        height_zone = "ABOVE"
+                    elif height_ratio < 0.20:
+                        height_zone = "HEAD"
+                    elif height_ratio <= 0.65:
+                        height_zone = "CENTER"
+                    elif ch_y <= by + bh:
+                        height_zone = "FEET"
+                    else:
+                        height_zone = "BELOW"
+
+                    # If crosshair is directly touching yellow enemy, it is physically on the target, not above or below
+                    if crosshair_locked and height_zone in ("ABOVE", "BELOW"):
+                        height_zone = "CENTER"
+
+                    # Strict Center Lock:
+                    # Crosshair must be horizontally centered (within middle 50% of body or directly on yellow) AND
+                    # vertically in the torso/chest center zone (20% to 65% height span)
+                    center_half_w = max(4.0, bw * 0.25)
+                    center_half_h = max(5.0, bh * 0.18)
+                    in_box = (bx <= ch_x <= bx + bw and by <= ch_y <= by + bh)
+                    is_center_x = (abs(raw_dx) <= center_half_w) or crosshair_locked
+                    is_center_y = (abs(raw_dy) <= center_half_h and (0.20 <= height_ratio <= 0.65)) or (crosshair_locked and in_box and (0.15 <= height_ratio <= 0.85))
+                    in_center = bool(is_center_x and is_center_y and in_box)
+
+                    # in_lock_zone is in_center OR crosshair directly on yellow
+                    in_lock_zone = bool(in_center or crosshair_locked)
 
                     return {
                         "has_target": True,
@@ -230,14 +259,19 @@ class FastAimDetector:
                         "dist_px": dist_px,
                         "box_w": float(bw),
                         "box_h": float(bh),
+                        "target_height": float(bh),
+                        "target_width": float(bw),
+                        "height_ratio": round(height_ratio, 3),
+                        "height_zone": height_zone,
+                        "in_center": in_center,
+                        "in_lock_zone": in_lock_zone,
+                        "crosshair_locked": crosshair_locked,
+                        "crosshair_color": crosshair_color,
                         "distance": round(dist_est, 2),
                         "confidence": 1.0,
                         "cue": cue,
                         "tier": "full",
                         "is_facing_sky": False,
-                        "in_lock_zone": in_lock_zone,
-                        "crosshair_locked": crosshair_locked,
-                        "crosshair_color": crosshair_color,
                     }
 
         self.prev_has_target = False
@@ -257,12 +291,17 @@ class FastAimDetector:
             "dist_px": 999.0,
             "box_w": 0.0,
             "box_h": 0.0,
+            "target_height": 0.0,
+            "target_width": 0.0,
+            "height_ratio": -1.0,
+            "height_zone": "NONE",
+            "in_center": False,
+            "in_lock_zone": False,
+            "crosshair_locked": crosshair_locked,
+            "crosshair_color": crosshair_color,
             "distance": 99.0,
             "confidence": 0.0,
             "cue": "none",
             "tier": "none",
             "is_facing_sky": False,
-            "in_lock_zone": crosshair_locked,
-            "crosshair_locked": crosshair_locked,
-            "crosshair_color": crosshair_color,
         }
